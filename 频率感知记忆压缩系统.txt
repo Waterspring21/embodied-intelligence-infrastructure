@@ -1,0 +1,3092 @@
+//! ═══════════════════════════════════════════════════════════════════════════════
+//! EIDOS v2.0 — 工业级频率感知记忆压缩引擎（终极单文件修复版）
+//! ═══════════════════════════════════════════════════════════════════════════════
+//!
+//! 核心哲学：
+//! - 频率权重：基于访问计数与时间衰减，保护高频记忆精度
+//! - 贪婪聚类：在线增量合并相似低频样本以节省空间
+//! - 互补升华：多级残差存储，按需渐进式重建
+//! - 分片快照：降低锁争用，支持无锁查询
+//! - 事务持久化：WAL + 合并计划，保证原子性与可恢复性
+//! - 向量索引抽象：可替换为任意 ANN 后端
+//!
+//! 编译: cargo build --release
+//! 运行: RUST_LOG=info cargo run --release
+//! ═══════════════════════════════════════════════════════════════════════════════
+#![warn(clippy::all, clippy::pedantic)]
+#![allow(clippy::too_many_arguments, clippy::module_name_repetitions)]
+use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::net::SocketAddr;
+use std::convert::Infallible;
+use chrono::{DateTime, Utc, TimeZone};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+use parking_lot::{RwLock, Mutex};
+use rayon::prelude::*;
+use log::{info, warn, error};
+use prometheus::{Encoder, IntCounter, IntGauge, Histogram, Registry, TextEncoder, HistogramOpts, IntCounterVec, HistogramVec};
+use hyper::{Method, Request, Response, StatusCode, Server, Body};
+use rand::{SeedableRng, Rng};
+use rand::rngs::StdRng;
+use sha2::{Sha256, Digest};
+use base64::{engine::general_purpose, Engine as _};
+use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm, TokenData};
+use notify::{Watcher, RecommendedWatcher, RecursiveMode, Event};
+use tokio::sync::Semaphore;
+use tokio::task::{self, JoinError};
+use anyhow::Result;
+use thiserror::Error;
+use sled;
+use bincode;
+use serde_json;
+// ============================================================
+// 核心错误类型与结果别名
+// ============================================================
+#[derive(Debug, Error)]
+pub enum EidosError {
+    #[error("Temporal storage failure: {0}")]
+    TemporalStorage(String),
+    #[error("Consciousness serialization failed: {0}")]
+    Serialization(String),
+    #[error("Invalid cosmic input: {0}")]
+    InvalidInput(String),
+    #[error("Cognitive orchestration error: {0}")]
+    Orchestration(String),
+    #[error("Spatial navigation failure: {0}")]
+    Navigation(String),
+    #[error("Quantum coherence lost: {0}")]
+    Coherence(String),
+    #[error("Dimensional shard isolation: {0}")]
+    ShardIsolation(String),
+    #[error("Configuration paradox: {0}")]
+    Configuration(String),
+    #[error("Index operation failed: {0}")]
+    IndexError(String),
+    #[error("Compaction plan execution failed: {0}")]
+    CompactionError(String),
+    #[error("Residual storage failure: {0}")]
+    ResidualError(String),
+    #[error("Internal state error: {0}")]
+    Internal(String),
+    #[error("Authentication failed: {0}")]
+    Auth(String),
+    #[error("Checksum mismatch: {0}")]
+    Checksum(String),
+    #[error("Task join error: {0}")]
+    JoinError(String),
+}
+impl From<sled::Error> for EidosError {
+    fn from(e: sled::Error) -> Self {
+        EidosError::TemporalStorage(e.to_string())
+    }
+}
+impl From<Box<bincode::ErrorKind>> for EidosError {
+    fn from(e: Box<bincode::ErrorKind>) -> Self {
+        EidosError::Serialization(e.to_string())
+    }
+}
+impl From<serde_json::Error> for EidosError {
+    fn from(e: serde_json::Error) -> Self {
+        EidosError::Serialization(e.to_string())
+    }
+}
+impl From<std::io::Error> for EidosError {
+    fn from(e: std::io::Error) -> Self {
+        EidosError::TemporalStorage(e.to_string())
+    }
+}
+impl From<jsonwebtoken::errors::Error> for EidosError {
+    fn from(e: jsonwebtoken::errors::Error) -> Self {
+        EidosError::Auth(e.to_string())
+    }
+}
+impl From<JoinError> for EidosError {
+    fn from(e: JoinError) -> Self {
+        EidosError::JoinError(e.to_string())
+    }
+}
+pub type EidosResult<T> = Result<T, EidosError>;
+// ============================================================
+// 宇宙时间戳 — 纳秒精度，支持时间旅行与衰减计算
+// ============================================================
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CosmicTimestamp {
+    epoch_nanos: i64,
+}
+impl CosmicTimestamp {
+    pub fn now() -> Self {
+        Self { epoch_nanos: Utc::now().timestamp_nanos_opt().unwrap() }
+    }
+    pub fn from_nanos(nanos: i64) -> Self {
+        Self { epoch_nanos: nanos }
+    }
+    pub fn from_datetime(dt: DateTime<Utc>) -> Self {
+        Self { epoch_nanos: dt.timestamp_nanos_opt().unwrap() }
+    }
+    pub fn to_datetime(&self) -> DateTime<Utc> {
+        Utc.timestamp_nanos(self.epoch_nanos)
+    }
+    pub fn elapsed_since(&self, other: CosmicTimestamp) -> Duration {
+        let diff = self.epoch_nanos.saturating_sub(other.epoch_nanos);
+        Duration::from_nanos(diff as u64)
+    }
+    pub fn age_seconds(&self) -> f64 {
+        Self::now().elapsed_since(*self).as_secs_f64()
+    }
+    pub fn as_i64(&self) -> i64 {
+        self.epoch_nanos
+    }
+}
+impl fmt::Display for CosmicTimestamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.to_datetime())
+    }
+}
+impl Default for CosmicTimestamp {
+    fn default() -> Self {
+        Self::now()
+    }
+}
+// ============================================================
+// 频率感知衰减策略（动态+静态融合）
+// ============================================================
+pub trait DecayStrategy: Send + Sync + 'static {
+    fn calculate_weight(&self, count: u64, last_access: CosmicTimestamp, now: CosmicTimestamp) -> f32;
+    fn name(&self) -> &'static str;
+}
+/// 对数衰减 — 适合长尾访问模式
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct LogarithmicDecay;
+impl DecayStrategy for LogarithmicDecay {
+    fn calculate_weight(&self, count: u64, last_access: CosmicTimestamp, now: CosmicTimestamp) -> f32 {
+        let age_secs = now.elapsed_since(last_access).as_secs_f64().max(1e-3);
+        let denom = age_secs.ln().max(1.0);
+        (count as f32) / denom as f32
+    }
+    fn name(&self) -> &'static str {
+        "logarithmic"
+    }
+}
+/// 指数衰减 — 可调半衰期
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ExponentialDecay {
+    pub half_life_hours: f64,
+}
+impl Default for ExponentialDecay {
+    fn default() -> Self {
+        Self { half_life_hours: 24.0 }
+    }
+}
+impl DecayStrategy for ExponentialDecay {
+    fn calculate_weight(&self, count: u64, last_access: CosmicTimestamp, now: CosmicTimestamp) -> f32 {
+        let age_hours = now.elapsed_since(last_access).as_secs_f64() / 3600.0;
+        let decay = (-age_hours * 0.693 / self.half_life_hours).exp();
+        (count as f32) * decay as f32
+    }
+    fn name(&self) -> &'static str {
+        "exponential"
+    }
+}
+/// 自适应衰减 — 在线学习访问模式，动态调整半衰期
+#[derive(Debug)]
+pub struct AdaptiveDecay {
+    ewma_interval_secs: Arc<Mutex<f64>>,
+    alpha: f64,
+    min_half_life: f64,
+    max_half_life: f64,
+    static_fallback: ExponentialDecay,
+}
+impl AdaptiveDecay {
+    pub fn new(alpha: f64, min_half_life: f64, max_half_life: f64) -> Self {
+        Self {
+            ewma_interval_secs: Arc::new(Mutex::new(60.0)),
+            alpha,
+            min_half_life,
+            max_half_life,
+            static_fallback: ExponentialDecay::default(),
+        }
+    }
+    /// 观察一次访问间隔，更新内部统计
+    pub fn observe_interval(&self, interval_secs: f64) {
+        let mut v = self.ewma_interval_secs.lock();
+        *v = self.alpha * interval_secs + (1.0 - self.alpha) * (*v);
+    }
+    fn inferred_half_life(&self) -> f64 {
+        let v = *self.ewma_interval_secs.lock();
+        (v / 3600.0).clamp(self.min_half_life, self.max_half_life)
+    }
+}
+impl DecayStrategy for AdaptiveDecay {
+    fn calculate_weight(&self, count: u64, last_access: CosmicTimestamp, now: CosmicTimestamp) -> f32 {
+        let half_life = self.inferred_half_life();
+        let dynamic = ExponentialDecay { half_life_hours: half_life };
+        let dynamic_weight = dynamic.calculate_weight(count, last_access, now);
+        let static_weight = self.static_fallback.calculate_weight(count, last_access, now);
+        
+        // 动态静态融合：取加权平均，随访问次数增加动态权重上升
+        let dynamic_alpha = (count as f32 / 100.0).min(0.8);
+        dynamic_weight * dynamic_alpha + static_weight * (1.0 - dynamic_alpha)
+    }
+    fn name(&self) -> &'static str {
+        "adaptive"
+    }
+}
+// ============================================================
+// 多级Pin管理系统
+// ============================================================
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PinLevel {
+    None,
+    User,
+    Task,
+    System,
+}
+impl Default for PinLevel {
+    fn default() -> Self {
+        PinLevel::None
+    }
+}
+impl fmt::Display for PinLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PinLevel::None => write!(f, "none"),
+            PinLevel::User => write!(f, "user"),
+            PinLevel::Task => write!(f, "task"),
+            PinLevel::System => write!(f, "system"),
+        }
+    }
+}
+// ============================================================
+// 空间几何引擎
+// ============================================================
+pub struct SpatialEngine;
+impl SpatialEngine {
+    #[inline]
+    pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+        if a.len() != b.len() {
+            return 0.0;
+        }
+        let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if na == 0.0 || nb == 0.0 {
+            0.0
+        } else {
+            (dot / (na * nb)).clamp(-1.0, 1.0)
+        }
+    }
+    #[inline]
+    pub fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt()
+    }
+    #[inline]
+    pub fn l2_norm(v: &[f32]) -> f32 {
+        v.iter().map(|x| x * x).sum::<f32>().sqrt()
+    }
+    #[inline]
+    pub fn incremental_mean(
+        old_mean: &[f32],
+        old_count: u64,
+        new_vec: &[f32],
+    ) -> Vec<f32> {
+        if old_count == 0 {
+            return new_vec.to_vec();
+        }
+        let total = (old_count + 1) as f32;
+        old_mean.iter().zip(new_vec.iter())
+            .map(|(o, n)| (o * old_count as f32 + n) / total)
+            .collect()
+    }
+    #[inline]
+    pub fn weighted_mean(
+        vec_a: &[f32],
+        weight_a: f64,
+        vec_b: &[f32],
+        weight_b: f64,
+    ) -> Vec<f32> {
+        let total = weight_a + weight_b;
+        if total == 0.0 {
+            return vec_a.to_vec();
+        }
+        vec_a.iter().zip(vec_b.iter())
+            .map(|(a, b)| (a * weight_a as f32 + b * weight_b as f32) / total as f32)
+            .collect()
+    }
+    #[inline]
+    pub fn residual(original: &[f32], approximation: &[f32]) -> Vec<f32> {
+        original.iter().zip(approximation.iter())
+            .map(|(o, a)| o - a)
+            .collect()
+    }
+    #[inline]
+    pub fn normalize(v: &mut [f32]) {
+        let norm = Self::l2_norm(v);
+        if norm > 0.0 {
+            for x in v {
+                *x /= norm;
+            }
+        }
+    }
+    pub fn quantize_8bit(v: &[f32], min_val: f32, max_val: f32) -> Vec<u8> {
+        let range = max_val - min_val;
+        if range == 0.0 {
+            return vec![128u8; v.len()];
+        }
+        v.iter()
+            .map(|x| {
+                let normalized = ((x - min_val) / range).clamp(0.0, 1.0);
+                (normalized * 255.0) as u8
+            })
+            .collect()
+    }
+    pub fn dequantize_8bit(q: &[u8], min_val: f32, max_val: f32) -> Vec<f32> {
+        let range = max_val - min_val;
+        q.iter()
+            .map(|&x| min_val + (x as f32 / 255.0) * range)
+            .collect()
+    }
+    pub fn random_project(v: &[f32], projection: &[Vec<f32>]) -> Vec<f32> {
+        projection.iter()
+            .map(|row| row.iter().zip(v.iter()).map(|(w, x)| w * x).sum())
+            .collect()
+    }
+    pub fn top_k_by_score<T>(items: &mut [(T, f32)], k: usize) {
+        if items.len() <= k {
+            items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            return;
+        }
+        items.select_nth_unstable_by(k, |a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        items[..k].sort_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+}
+// ============================================================
+// 残差压缩后端（可热切换、版本化）
+// ============================================================
+pub trait ResidualCompressor: Send + Sync {
+    fn compress(&self, vec: &[f32]) -> EidosResult<Vec<u8>>;
+    fn decompress(&self, bytes: &[u8]) -> EidosResult<Vec<f32>>;
+    fn name(&self) -> &'static str;
+    fn version(&self) -> u32;
+}
+/// 恒等压缩 — 无损，用于调试与基线
+#[derive(Debug)]
+pub struct IdentityCompressor;
+impl ResidualCompressor for IdentityCompressor {
+    fn compress(&self, vec: &[f32]) -> EidosResult<Vec<u8>> {
+        Ok(bincode::serialize(vec)?)
+    }
+    fn decompress(&self, bytes: &[u8]) -> EidosResult<Vec<f32>> {
+        Ok(bincode::deserialize(bytes)?)
+    }
+    fn name(&self) -> &'static str {
+        "identity"
+    }
+    fn version(&self) -> u32 {
+        1
+    }
+}
+/// 随机投影压缩 — 降维后序列化
+#[derive(Debug)]
+pub struct RandomProjectionCompressor {
+    proj: Vec<Vec<f32>>,
+    target_dim: usize,
+    version_id: u32,
+}
+impl RandomProjectionCompressor {
+    pub fn new(original_dim: usize, target_dim: usize, seed: u64, version_id: u32) -> Self {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let proj = (0..target_dim)
+            .map(|_| (0..original_dim).map(|_| rng.gen::<f32>() - 0.5).collect())
+            .collect();
+        Self { proj, target_dim, version_id }
+    }
+}
+impl ResidualCompressor for RandomProjectionCompressor {
+    fn compress(&self, vec: &[f32]) -> EidosResult<Vec<u8>> {
+        let projected = SpatialEngine::random_project(vec, &self.proj);
+        let mut payload = Vec::new();
+        payload.extend(&self.version_id.to_le_bytes());
+        payload.extend(&(self.target_dim as u32).to_le_bytes());
+        payload.extend(bincode::serialize(&projected)?);
+        Ok(payload)
+    }
+    fn decompress(&self, bytes: &[u8]) -> EidosResult<Vec<f32>> {
+        if bytes.len() < 8 {
+            return Err(EidosError::Serialization("payload too small".into()));
+        }
+        let version = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let dim = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        if version != self.version_id || dim != self.target_dim {
+            return Err(EidosError::Serialization("version/dim mismatch".into()));
+        }
+        let projected: Vec<f32> = bincode::deserialize(&bytes[8..])?;
+        Ok(projected)
+    }
+    fn name(&self) -> &'static str {
+        "random_projection"
+    }
+    fn version(&self) -> u32 {
+        self.version_id
+    }
+}
+/// 8-bit 量化压缩 — 有损但高效
+#[derive(Debug)]
+pub struct Quantize8Compressor {
+    version_id: u32,
+}
+impl Quantize8Compressor {
+    pub fn new(version_id: u32) -> Self {
+        Self { version_id }
+    }
+}
+impl ResidualCompressor for Quantize8Compressor {
+    fn compress(&self, vec: &[f32]) -> EidosResult<Vec<u8>> {
+        let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut out = Vec::with_capacity(12 + vec.len());
+        out.extend(&self.version_id.to_le_bytes());
+        out.extend(&min.to_le_bytes());
+        out.extend(&max.to_le_bytes());
+        out.extend(SpatialEngine::quantize_8bit(vec, min, max));
+        Ok(out)
+    }
+    fn decompress(&self, bytes: &[u8]) -> EidosResult<Vec<f32>> {
+        if bytes.len() < 12 {
+            return Err(EidosError::Serialization("payload too small".into()));
+        }
+        let version = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        if version != self.version_id {
+            return Err(EidosError::Serialization("version mismatch".into()));
+        }
+        let min = f32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let max = f32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        Ok(SpatialEngine::dequantize_8bit(&bytes[12..], min, max))
+    }
+    fn name(&self) -> &'static str {
+        "quantize8"
+    }
+    fn version(&self) -> u32 {
+        self.version_id
+    }
+}
+// ============================================================
+// 高级残差存储（多级、校验、版本化）
+// ============================================================
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResidualChunkMeta {
+    pub crystal_id: Uuid,
+    pub level: u8,
+    pub compressor_name: String,
+    pub compressor_version: u32,
+    pub bytes_len: usize,
+    pub checksum: String,
+    pub created_at: CosmicTimestamp,
+}
+pub trait AdvancedResidualStore: Send + Sync {
+    fn store_chunk(&self, crystal_id: &Uuid, level: u8, data: &[u8], compressor_name: &str, compressor_version: u32) -> EidosResult<()>;
+    fn get_chunk_meta(&self, crystal_id: &Uuid) -> EidosResult<Vec<ResidualChunkMeta>>;
+    fn get_chunk(&self, crystal_id: &Uuid, level: u8) -> EidosResult<Option<Vec<u8>>>;
+    fn remove_chunks(&self, crystal_id: &Uuid) -> EidosResult<()>;
+    fn count_chunks(&self) -> EidosResult<usize>;
+    fn set_active_compressor(&self, name: &str, version: u32);
+    fn active_compressor(&self) -> (String, u32);
+}
+/// Sled 实现的残差存储
+pub struct SledAdvancedResidualStore {
+    tree: sled::Tree,
+    meta_tree: sled::Tree,
+    compressor_meta: RwLock<(String, u32)>,
+}
+impl SledAdvancedResidualStore {
+    pub fn open(db: &sled::Db, initial_compressor: (String, u32)) -> EidosResult<Self> {
+        let tree = db.open_tree("residual_chunks")?;
+        let meta_tree = db.open_tree("residual_meta")?;
+        Ok(Self {
+            tree,
+            meta_tree,
+            compressor_meta: RwLock::new(initial_compressor),
+        })
+    }
+    fn composite_key(crystal_id: &Uuid, level: u8) -> Vec<u8> {
+        let mut k = Vec::with_capacity(17);
+        k.extend_from_slice(crystal_id.as_bytes());
+        k.push(level);
+        k
+    }
+    fn checksum(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        general_purpose::STANDARD.encode(hasher.finalize())
+    }
+}
+impl AdvancedResidualStore for SledAdvancedResidualStore {
+    fn store_chunk(&self, crystal_id: &Uuid, level: u8, data: &[u8], compressor_name: &str, compressor_version: u32) -> EidosResult<()> {
+        let key = Self::composite_key(crystal_id, level);
+        let checksum = Self::checksum(data);
+        self.tree.insert(&key, data)?;
+        self.tree.flush()?;
+        
+        let mut metas = match self.meta_tree.get(crystal_id.as_bytes())? {
+            Some(ivec) => bincode::deserialize::<Vec<ResidualChunkMeta>>(&ivec)?,
+            None => Vec::new(),
+        };
+        metas.retain(|m| m.level != level);
+        metas.push(ResidualChunkMeta {
+            crystal_id: *crystal_id,
+            level,
+            compressor_name: compressor_name.to_string(),
+            compressor_version,
+            bytes_len: data.len(),
+            checksum,
+            created_at: CosmicTimestamp::now(),
+        });
+        
+        let meta_bytes = bincode::serialize(&metas)?;
+        self.meta_tree.insert(crystal_id.as_bytes(), meta_bytes)?;
+        self.meta_tree.flush()?;
+        Ok(())
+    }
+    fn get_chunk_meta(&self, crystal_id: &Uuid) -> EidosResult<Vec<ResidualChunkMeta>> {
+        match self.meta_tree.get(crystal_id.as_bytes())? {
+            Some(ivec) => Ok(bincode::deserialize(&ivec)?),
+            None => Ok(Vec::new()),
+        }
+    }
+    fn get_chunk(&self, crystal_id: &Uuid, level: u8) -> EidosResult<Option<Vec<u8>>> {
+        let key = Self::composite_key(crystal_id, level);
+        match self.tree.get(&key)? {
+            Some(ivec) => {
+                let bytes = ivec.to_vec();
+                if let Some(meta) = self.get_chunk_meta(crystal_id)?.into_iter().find(|m| m.level == level) {
+                    let actual = Self::checksum(&bytes);
+                    if actual != meta.checksum {
+                        return Err(EidosError::Checksum(format!("chunk checksum mismatch for {} level {}", crystal_id, level)));
+                    }
+                }
+                Ok(Some(bytes))
+            }
+            None => Ok(None),
+        }
+    }
+    fn remove_chunks(&self, crystal_id: &Uuid) -> EidosResult<()> {
+        if let Some(ivec) = self.meta_tree.get(crystal_id.as_bytes())? {
+            let metas: Vec<ResidualChunkMeta> = bincode::deserialize(&ivec)?;
+            for m in metas {
+                let key = Self::composite_key(&m.crystal_id, m.level);
+                let _ = self.tree.remove(key);
+            }
+            self.meta_tree.remove(crystal_id.as_bytes())?;
+            self.tree.flush()?;
+            self.meta_tree.flush()?;
+        }
+        Ok(())
+    }
+    fn count_chunks(&self) -> EidosResult<usize> {
+        Ok(self.tree.len())
+    }
+    fn set_active_compressor(&self, name: &str, version: u32) {
+        *self.compressor_meta.write() = (name.to_string(), version);
+    }
+    fn active_compressor(&self) -> (String, u32) {
+        self.compressor_meta.read().clone()
+    }
+}
+// ============================================================
+// 渐进式残差重建
+// ============================================================
+#[derive(Debug, Clone)]
+pub struct RecallRequest {
+    pub crystal_id: Uuid,
+    pub target_quality: f32,
+    pub timeout: Duration,
+    pub trace_id: Option<String>,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct RecallResult {
+    pub crystal_id: Uuid,
+    pub reconstructed: Vec<f32>,
+    pub quality: f32,
+    pub used_levels: Vec<u8>,
+    pub duration_ms: u128,
+}
+pub struct RecallManager {
+    residual_store: Arc<dyn AdvancedResidualStore + Send + Sync>,
+    compressors: HashMap<String, Arc<dyn ResidualCompressor + Send + Sync>>,
+    limiter: Arc<Semaphore>,
+    metrics: Arc<EidosMetrics>,
+}
+impl RecallManager {
+    pub fn new(
+        residual_store: Arc<dyn AdvancedResidualStore + Send + Sync>,
+        max_concurrent: usize,
+        metrics: Arc<EidosMetrics>,
+    ) -> Self {
+        let mut compressors = HashMap::new();
+        compressors.insert("identity".to_string(), Arc::new(IdentityCompressor) as Arc<_>);
+        compressors.insert("quantize8".to_string(), Arc::new(Quantize8Compressor::new(1)) as Arc<_>);
+        
+        Self {
+            residual_store,
+            compressors,
+            limiter: Arc::new(Semaphore::new(max_concurrent)),
+            metrics,
+        }
+    }
+    pub fn register_compressor(&mut self, name: String, compressor: Arc<dyn ResidualCompressor + Send + Sync>) {
+        self.compressors.insert(name, compressor);
+    }
+    pub async fn recall(&self, req: RecallRequest, centroid: &[f32]) -> EidosResult<RecallResult> {
+        let start = Instant::now();
+        let permit = self.limiter.acquire().await
+            .map_err(|e| EidosError::Internal(format!("limiter closed: {}", e)))?;
+        let _permit = permit;
+        let mut reconstructed = centroid.to_vec();
+        let mut used_levels = Vec::new();
+        let mut quality = 0.5f32;
+        let metas = self.residual_store.get_chunk_meta(&req.crystal_id)?;
+        if metas.is_empty() {
+            self.metrics.recall_requests.with_label_values(&["success"]).inc();
+            return Ok(RecallResult {
+                crystal_id: req.crystal_id,
+                reconstructed,
+                quality,
+                used_levels,
+                duration_ms: start.elapsed().as_millis(),
+            });
+        }
+        let mut metas_sorted = metas;
+        metas_sorted.sort_by_key(|m| m.level);
+        for meta in metas_sorted {
+            if start.elapsed() > req.timeout {
+                break;
+            }
+            if let Some(bytes) = self.residual_store.get_chunk(&req.crystal_id, meta.level)? {
+                if let Some(compressor) = self.compressors.get(&meta.compressor_name) {
+                    if compressor.version() == meta.compressor_version {
+                        let res_vec = compressor.decompress(&bytes)?;
+                        if res_vec.len() == reconstructed.len() {
+                            for (r, s) in reconstructed.iter_mut().zip(res_vec.iter()) {
+                                *r += s;
+                            }
+                        } else {
+                            warn!("residual dim mismatch for {} level {}", req.crystal_id, meta.level);
+                        }
+                        used_levels.push(meta.level);
+                        quality = (quality + 0.5_f32 / (meta.level as f32 + 1.0)).min(1.0);
+                        self.metrics.recall_levels_observed.with_label_values(&[&meta.level.to_string()]).inc();
+                        if quality >= req.target_quality {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        self.metrics.recall_requests.with_label_values(&["success"]).inc();
+        Ok(RecallResult {
+            crystal_id: req.crystal_id,
+            reconstructed,
+            quality,
+            used_levels,
+            duration_ms: start.elapsed().as_millis(),
+        })
+    }
+}
+// ============================================================
+// 意识流（输入管道单元）
+// ============================================================
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsciousnessStream {
+    pub id: Uuid,
+    pub timestamp: CosmicTimestamp,
+    pub feature: Vec<f32>,
+    pub metadata: serde_json::Value,
+    pub confidence: f32,
+    pub priority: u8,
+    pub provenance: Option<String>,
+    pub ttl_seconds: Option<u64>,
+}
+impl ConsciousnessStream {
+    pub fn new(feature: Vec<f32>, metadata: serde_json::Value) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            timestamp: CosmicTimestamp::now(),
+            feature,
+            metadata,
+            confidence: 1.0,
+            priority: 0,
+            provenance: None,
+            ttl_seconds: None,
+        }
+    }
+    pub fn with_id(id: Uuid, feature: Vec<f32>, metadata: serde_json::Value) -> Self {
+        Self {
+            id,
+            timestamp: CosmicTimestamp::now(),
+            feature,
+            metadata,
+            confidence: 1.0,
+            priority: 0,
+            provenance: None,
+            ttl_seconds: None,
+        }
+    }
+    pub fn with_confidence(mut self, confidence: f32) -> Self {
+        self.confidence = confidence.clamp(0.0, 1.0);
+        self
+    }
+    pub fn with_priority(mut self, priority: u8) -> Self {
+        self.priority = priority;
+        self
+    }
+    pub fn with_provenance(mut self, s: impl Into<String>) -> Self {
+        self.provenance = Some(s.into());
+        self
+    }
+    pub fn with_ttl(mut self, secs: u64) -> Self {
+        self.ttl_seconds = Some(secs);
+        self
+    }
+    pub fn dimension(&self) -> usize {
+        self.feature.len()
+    }
+    pub fn normalize_inplace(&mut self) {
+        SpatialEngine::normalize(&mut self.feature);
+    }
+    pub fn to_json(&self) -> EidosResult<String> {
+        Ok(serde_json::to_string(self)?)
+    }
+}
+// ============================================================
+// 记忆水晶（核心记忆单元）
+// ============================================================
+pub const MEMORY_CRYSTAL_SCHEMA_VERSION: u32 = 3;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryCrystal {
+    pub schema_version: u32,
+    pub id: Uuid,
+    pub centroid: Vec<f32>,
+    pub count: u64,
+    pub last_access: CosmicTimestamp,
+    pub created_at: CosmicTimestamp,
+    pub anomaly_score: f32,
+    pub has_residual: bool,
+    pub pin_level: PinLevel,
+    pub pin_expiration: Option<CosmicTimestamp>,
+    pub metadata: serde_json::Value,
+    pub compression_ratio: f32,
+    pub quality_score: f32,
+    pub lineage: Option<Vec<Uuid>>,
+}
+impl MemoryCrystal {
+    pub fn from_consciousness(percept: &ConsciousnessStream) -> Self {
+        Self {
+            schema_version: MEMORY_CRYSTAL_SCHEMA_VERSION,
+            id: Uuid::new_v4(),
+            centroid: percept.feature.clone(),
+            count: 1,
+            last_access: percept.timestamp,
+            created_at: percept.timestamp,
+            anomaly_score: 0.0,
+            has_residual: false,
+            pin_level: PinLevel::None,
+            pin_expiration: None,
+            metadata: percept.metadata.clone(),
+            compression_ratio: 1.0,
+            quality_score: 1.0,
+            lineage: None,
+        }
+    }
+    pub fn update_on_access(&mut self, now: CosmicTimestamp) {
+        self.last_access = now;
+        self.count = self.count.saturating_add(1);
+    }
+    pub fn is_pinned(&self, now: CosmicTimestamp) -> bool {
+        match self.pin_level {
+            PinLevel::None => false,
+            _ => match self.pin_expiration {
+                None => true,
+                Some(exp) => now.as_i64() < exp.as_i64(),
+            },
+        }
+    }
+    pub fn pin_permanent(&mut self, level: PinLevel) {
+        self.pin_level = level;
+        self.pin_expiration = None;
+    }
+    pub fn pin_until(&mut self, level: PinLevel, expiration: CosmicTimestamp) {
+        self.pin_level = level;
+        self.pin_expiration = Some(expiration);
+    }
+    pub fn unpin(&mut self) {
+        self.pin_level = PinLevel::None;
+        self.pin_expiration = None;
+    }
+    pub fn update_quality(&mut self) {
+        let anomaly_penalty = 1.0 - (self.anomaly_score * 0.5).min(0.5);
+        let compression_bonus = self.compression_ratio.min(1.0);
+        self.quality_score = anomaly_penalty * compression_bonus;
+    }
+    pub fn age_seconds(&self, now: CosmicTimestamp) -> f64 {
+        now.elapsed_since(self.created_at).as_secs_f64()
+    }
+}
+// ============================================================
+// 压缩计划与WAL状态机
+// ============================================================
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WalState {
+    Pending,
+    Applying,
+    Committed,
+    Aborted,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WalRecord {
+    CompactionPlan(CompactionPlan),
+    Operation(OperationLog),
+    Checkpoint { epoch: u64, note: String },
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionPlan {
+    pub plan_id: Uuid,
+    pub epoch: u64,
+    pub inputs: Vec<Uuid>,
+    pub outputs: Vec<MemoryCrystal>,
+    pub created_at: CosmicTimestamp,
+    pub reason: String,
+    pub estimated_savings: usize,
+    pub checksum: String,
+    pub dry_run: bool,
+    pub wal_state: WalState,
+}
+impl CompactionPlan {
+    pub fn new(reason: impl Into<String>, inputs: Vec<Uuid>, outputs: Vec<MemoryCrystal>, dry_run: bool) -> Self {
+        let epoch = Utc::now().timestamp_millis() as u64;
+        let mut plan = Self {
+            plan_id: Uuid::new_v4(),
+            epoch,
+            inputs,
+            outputs,
+            created_at: CosmicTimestamp::now(),
+            reason: reason.into(),
+            estimated_savings: 0,
+            checksum: String::new(),
+            dry_run,
+            wal_state: WalState::Pending,
+        };
+        plan.estimated_savings = plan.inputs.len().saturating_sub(plan.outputs.len());
+        plan.checksum = plan.compute_checksum();
+        plan
+    }
+    pub fn compute_checksum(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.plan_id.as_bytes());
+        hasher.update(&self.epoch.to_le_bytes());
+        for id in &self.inputs {
+            hasher.update(id.as_bytes());
+        }
+        for out in &self.outputs {
+            hasher.update(out.id.as_bytes());
+            hasher.update(&out.count.to_le_bytes());
+            for f in &out.centroid {
+                hasher.update(&f.to_le_bytes());
+            }
+        }
+        general_purpose::STANDARD.encode(hasher.finalize())
+    }
+    pub fn validate_invariants(&self) -> EidosResult<()> {
+        if self.outputs.is_empty() {
+            return Err(EidosError::CompactionError("outputs empty".into()));
+        }
+        if self.checksum != self.compute_checksum() {
+            return Err(EidosError::CompactionError("checksum mismatch".into()));
+        }
+        for out in &self.outputs {
+            if self.inputs.contains(&out.id) {
+                return Err(EidosError::CompactionError(format!("output id {} also in inputs", out.id)));
+            }
+        }
+        Ok(())
+    }
+}
+// ============================================================
+// 操作日志与审计
+// ============================================================
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationLog {
+    pub timestamp: CosmicTimestamp,
+    pub operation_type: String,
+    pub details: serde_json::Value,
+    pub severity: String,
+    pub duration_us: u64,
+    pub trace_id: Option<String>,
+}
+impl OperationLog {
+    pub fn new(operation_type: impl Into<String>, details: serde_json::Value) -> Self {
+        Self {
+            timestamp: CosmicTimestamp::now(),
+            operation_type: operation_type.into(),
+            details,
+            severity: "info".into(),
+            duration_us: 0,
+            trace_id: None,
+        }
+    }
+    pub fn with_severity(mut self, s: impl Into<String>) -> Self {
+        self.severity = s.into();
+        self
+    }
+    pub fn with_duration(mut self, duration: Duration) -> Self {
+        self.duration_us = duration.as_micros() as u64;
+        self
+    }
+    pub fn with_trace(mut self, t: impl Into<String>) -> Self {
+        self.trace_id = Some(t.into());
+        self
+    }
+}
+// ============================================================
+// 时间金库（WAL恢复、事务、并行恢复）
+// ============================================================
+#[derive(Debug, Clone)]
+pub struct RecoveryReport {
+    pub recovered_plans: usize,
+    pub aborted_plans: usize,
+    pub errors: Vec<String>,
+    pub duration_ms: u128,
+}
+pub struct TemporalVault {
+    db: sled::Db,
+    crystals_tree: sled::Tree,
+    wal_tree: sled::Tree,
+    oplog_tree: sled::Tree,
+    config_tree: sled::Tree,
+    cache: Arc<RwLock<Option<Vec<MemoryCrystal>>>>,
+    metrics: Arc<EidosMetrics>,
+    op_semaphore: Arc<Semaphore>,
+}
+impl TemporalVault {
+    pub fn open<P: AsRef<Path>>(path: P, max_concurrent_ops: usize) -> EidosResult<Self> {
+        let path = path.as_ref().to_path_buf();
+        let db = sled::Config::default()
+            .path(&path)
+            .cache_capacity(256 * 1024 * 1024)
+            .flush_every_ms(Some(100))
+            .use_compression(true)
+            .compression_factor(3)
+            .open()?;
+        
+        let crystals_tree = db.open_tree("crystals_v3")?;
+        let wal_tree = db.open_tree("wal_v3")?;
+        let oplog_tree = db.open_tree("oplog_v3")?;
+        let config_tree = db.open_tree("config_v3")?;
+        let metrics = Arc::new(EidosMetrics::new());
+        
+        Ok(Self {
+            db,
+            crystals_tree,
+            wal_tree,
+            oplog_tree,
+            config_tree,
+            cache: Arc::new(RwLock::new(None)),
+            metrics,
+            op_semaphore: Arc::new(Semaphore::new(max_concurrent_ops)),
+        })
+    }
+    pub fn db(&self) -> &sled::Db {
+        &self.db
+    }
+    pub fn append_wal(&self, rec: &WalRecord) -> EidosResult<()> {
+        let key = format!("{}:{}", Utc::now().timestamp_nanos_opt().unwrap(), Uuid::new_v4());
+        let value = bincode::serialize(rec)?;
+        self.wal_tree.insert(key.as_bytes(), value)?;
+        self.wal_tree.flush()?;
+        self.metrics.wal_appends.with_label_values(&["success"]).inc();
+        Ok(())
+    }
+    pub fn store_crystal(&self, crystal: &MemoryCrystal) -> EidosResult<()> {
+        let key = crystal.id.as_bytes();
+        let value = bincode::serialize(crystal)?;
+        self.crystals_tree.insert(key, value)?;
+        self.crystals_tree.flush()?;
+        *self.cache.write() = None;
+        self.metrics.crystal_stores.with_label_values(&["success"]).inc();
+        Ok(())
+    }
+    pub fn batch_store_crystals(&self, crystals: &[MemoryCrystal]) -> EidosResult<()> {
+        if crystals.is_empty() {
+            return Ok(());
+        }
+        let tree = &self.crystals_tree;
+        tree.transaction(|txn| {
+            for crystal in crystals {
+                let key = crystal.id.as_bytes();
+                let value = bincode::serialize(crystal)
+                    .map_err(|e| sled::transaction::ConflictableTransactionError::Abort(
+                        EidosError::Serialization(e.to_string())
+                    ))?;
+                txn.insert(key, value)?;
+            }
+            Ok(())
+        }).map_err(|e| match e {
+            sled::transaction::TransactionError::Storage(err) => {
+                EidosError::TemporalStorage(err.to_string())
+            }
+            sled::transaction::TransactionError::Abort(err) => err,
+        })?;
+        self.crystals_tree.flush()?;
+        *self.cache.write() = None;
+        Ok(())
+    }
+    pub fn retrieve_crystal(&self, id: &Uuid) -> EidosResult<Option<MemoryCrystal>> {
+        match self.crystals_tree.get(id.as_bytes())? {
+            Some(ivec) => Ok(Some(bincode::deserialize(&ivec)?)),
+            None => Ok(None),
+        }
+    }
+    pub fn delete_crystal(&self, id: &Uuid) -> EidosResult<()> {
+        self.crystals_tree.remove(id.as_bytes())?;
+        self.crystals_tree.flush()?;
+        *self.cache.write() = None;
+        Ok(())
+    }
+    pub fn iterate_crystals(&self) -> EidosResult<Vec<MemoryCrystal>> {
+        if let Some(cached) = self.cache.read().as_ref() {
+            return Ok(cached.clone());
+        }
+        let mut crystals = Vec::new();
+        for item in self.crystals_tree.iter() {
+            let (_, ivec) = item?;
+            let crystal: MemoryCrystal = bincode::deserialize(&ivec)?;
+            crystals.push(crystal);
+        }
+        *self.cache.write() = Some(crystals.clone());
+        Ok(crystals)
+    }
+    pub fn crystal_count(&self) -> EidosResult<usize> {
+        Ok(self.crystals_tree.len())
+    }
+    pub fn append_oplog(&self, op: &OperationLog) -> EidosResult<()> {
+        let key = format!("{}:{}", op.timestamp.as_i64(), Uuid::new_v4());
+        let value = bincode::serialize(op)?;
+        self.oplog_tree.insert(key.as_bytes(), value)?;
+        self.oplog_tree.flush()?;
+        self.metrics.oplog_appends.with_label_values(&[&op.severity]).inc();
+        Ok(())
+    }
+    pub fn recent_operations(&self, limit: usize) -> EidosResult<Vec<OperationLog>> {
+        let mut ops = Vec::new();
+        for item in self.oplog_tree.iter().rev().take(limit) {
+            let (_, ivec) = item?;
+            let op: OperationLog = bincode::deserialize(&ivec)?;
+            ops.push(op);
+        }
+        Ok(ops)
+    }
+    /// WAL恢复：并行重放，带校验和验证与恢复报告
+    pub fn recover_from_wal(&self) -> EidosResult<RecoveryReport> {
+        let start = Instant::now();
+        let mut recovered = 0usize;
+        let mut aborted = 0usize;
+        let mut errors = Vec::new();
+        let entries: Vec<(Vec<u8>, WalRecord)> = self.wal_tree.iter()
+            .filter_map(|item| item.ok())
+            .filter_map(|(k, v)| {
+                let rec: WalRecord = bincode::deserialize(&v).ok()?;
+                Some((k.to_vec(), rec))
+            })
+            .collect();
+        let sem = self.op_semaphore.clone();
+        let metrics = self.metrics.clone();
+        let crystals_tree = self.crystals_tree.clone();
+        let oplog_tree = self.oplog_tree.clone();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut handles = Vec::new();
+            for (_k, rec) in entries {
+                let permit = match sem.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        errors.push("semaphore closed".to_string());
+                        break;
+                    }
+                };
+                let crystals_tree = crystals_tree.clone();
+                let oplog_tree = oplog_tree.clone();
+                let metrics = metrics.clone();
+                let handle = task::spawn(async move {
+                    let _p = permit;
+                    match rec {
+                        WalRecord::CompactionPlan(plan) => {
+                            if plan.checksum != plan.compute_checksum() {
+                                metrics.wal_invalid.with_label_values(&["checksum"]).inc();
+                                return Err(format!("plan checksum mismatch {}", plan.plan_id));
+                            }
+                            match plan.wal_state {
+                                WalState::Pending | WalState::Applying => {
+                                    let epoch = plan.epoch;
+                                    for out in &plan.outputs {
+                                        let tmp_key = format!("tmp:{}:{}", out.id, epoch);
+                                        let value = bincode::serialize(out).map_err(|e| e.to_string())?;
+                                        crystals_tree.insert(tmp_key.as_bytes(), value).map_err(|e| e.to_string())?;
+                                    }
+                                    crystals_tree.flush().map_err(|e| e.to_string())?;
+                                    let inputs = plan.inputs.clone();
+                                    let outputs = plan.outputs.clone();
+                                    let epoch_copy = epoch;
+                                    let tx_res = crystals_tree.transaction(|txn| {
+                                        for out in &outputs {
+                                            let tmp_key = format!("tmp:{}:{}", out.id, epoch_copy);
+                                            let tmp_val = txn.get(tmp_key.as_bytes())?
+                                                .ok_or_else(|| sled::transaction::ConflictableTransactionError::Abort(
+                                                    EidosError::CompactionError(format!("missing tmp for {}", out.id))
+                                                ))?;
+                                            txn.insert(out.id.as_bytes(), tmp_val)?;
+                                            txn.remove(tmp_key.as_bytes())?;
+                                        }
+                                        for in_id in &inputs {
+                                            txn.remove(in_id.as_bytes())?;
+                                        }
+                                        Ok(())
+                                    });
+                                    match tx_res {
+                                        Ok(_) => {
+                                            metrics.wal_replayed.with_label_values(&["compaction"]).inc();
+                                            Ok(())
+                                        }
+                                        Err(e) => Err(format!("transaction failed: {:?}", e)),
+                                    }
+                                }
+                                WalState::Committed => Ok(()),
+                                WalState::Aborted => Err(format!("plan aborted {}", plan.plan_id)),
+                            }
+                        }
+                        WalRecord::Operation(op) => {
+                            let key = format!("{}:{}", op.timestamp.as_i64(), Uuid::new_v4());
+                            let value = bincode::serialize(&op).map_err(|e| e.to_string())?;
+                            oplog_tree.insert(key.as_bytes(), value).map_err(|e| e.to_string())?;
+                            oplog_tree.flush().map_err(|e| e.to_string())?;
+                            Ok(())
+                        }
+                        WalRecord::Checkpoint { .. } => {
+                            metrics.wal_checkpoints.with_label_values(&["auto"]).inc();
+                            Ok(())
+                        }
+                    }
+                });
+                handles.push(handle);
+            }
+            for h in handles {
+                match h.await {
+                    Ok(Ok(())) => recovered += 1,
+                    Ok(Err(e)) => {
+                        aborted += 1;
+                        errors.push(e);
+                    }
+                    Err(e) => {
+                        aborted += 1;
+                        errors.push(format!("task join error: {}", e));
+                    }
+                }
+            }
+        });
+        Ok(RecoveryReport {
+            recovered_plans: recovered,
+            aborted_plans: aborted,
+            errors,
+            duration_ms: start.elapsed().as_millis(),
+        })
+    }
+    /// 执行压缩计划（事务化、可回滚）
+    pub fn execute_compaction_plan(&self, plan: &CompactionPlan) -> EidosResult<()> {
+        plan.validate_invariants()?;
+        self.append_wal(&WalRecord::CompactionPlan(plan.clone()))?;
+        if plan.dry_run {
+            let op = OperationLog::new("compaction_plan_dryrun", serde_json::json!({
+                "plan_id": plan.plan_id.to_string(),
+                "inputs": plan.inputs.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+                "outputs": plan.outputs.iter().map(|o| o.id.to_string()).collect::<Vec<_>>(),
+            }));
+            let _ = self.append_oplog(&op);
+            return Ok(());
+        }
+        let epoch = plan.epoch;
+        for out in &plan.outputs {
+            let tmp_key = format!("tmp:{}:{}", out.id, epoch);
+            let value = bincode::serialize(out)?;
+            self.crystals_tree.insert(tmp_key.as_bytes(), value)?;
+        }
+        self.crystals_tree.flush()?;
+        let inputs = plan.inputs.clone();
+        let outputs = plan.outputs.clone();
+        let epoch_copy = epoch;
+        let res = self.crystals_tree.transaction(|txn| {
+            for out in &outputs {
+                let tmp_key = format!("tmp:{}:{}", out.id, epoch_copy);
+                let tmp_val = txn.get(tmp_key.as_bytes())?
+                    .ok_or_else(|| sled::transaction::ConflictableTransactionError::Abort(
+                        EidosError::CompactionError(format!("missing tmp for {}", out.id))
+                    ))?;
+                txn.insert(out.id.as_bytes(), tmp_val)?;
+                txn.remove(tmp_key.as_bytes())?;
+            }
+            for in_id in &inputs {
+                txn.remove(in_id.as_bytes())?;
+            }
+            Ok(())
+        });
+        match res {
+            Ok(_) => {
+                self.crystals_tree.flush()?;
+                let op = OperationLog::new("compaction_execute", serde_json::json!({
+                    "plan_id": plan.plan_id.to_string(),
+                    "inputs": plan.inputs.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+                    "outputs": plan.outputs.iter().map(|o| o.id.to_string()).collect::<Vec<_>>(),
+                }));
+                let _ = self.append_oplog(&op);
+                Ok(())
+            }
+            Err(e) => {
+                for out in &plan.outputs {
+                    let tmp_key = format!("tmp:{}:{}", out.id, epoch);
+                    let _ = self.crystals_tree.remove(tmp_key.as_bytes());
+                }
+                self.crystals_tree.flush()?;
+                Err(match e {
+                    sled::transaction::TransactionError::Storage(err) => EidosError::TemporalStorage(err.to_string()),
+                    sled::transaction::TransactionError::Abort(err) => err,
+                })
+            }
+        }
+    }
+    pub fn set_config(&self, key: &str, value: &str) -> EidosResult<()> {
+        self.config_tree.insert(key.as_bytes(), value.as_bytes())?;
+        self.config_tree.flush()?;
+        Ok(())
+    }
+    pub fn get_config(&self, key: &str) -> EidosResult<Option<String>> {
+        match self.config_tree.get(key.as_bytes())? {
+            Some(ivec) => {
+                let value = String::from_utf8(ivec.to_vec())
+                    .map_err(|e| EidosError::Serialization(e.to_string()))?;
+                Ok(Some(value))
+            }
+            None => Ok(None),
+        }
+    }
+    pub fn flush(&self) -> EidosResult<()> {
+        self.db.flush()?;
+        Ok(())
+    }
+}
+// ============================================================
+// 维度分片
+// ============================================================
+pub struct DimensionalShard {
+    pub crystals: RwLock<Vec<MemoryCrystal>>,
+    pub id: usize,
+}
+impl DimensionalShard {
+    pub fn new(id: usize) -> Self {
+        Self {
+            crystals: RwLock::new(Vec::new()),
+            id,
+        }
+    }
+    pub fn snapshot(&self) -> Vec<MemoryCrystal> {
+        self.crystals.read().clone()
+    }
+    pub fn ingest_local<D: DecayStrategy + ?Sized>(
+        &self,
+        percept: &ConsciousnessStream,
+        similarity_threshold: f32,
+        now: CosmicTimestamp,
+        decay: &D,
+    ) -> bool {
+        let mut crystals = self.crystals.write();
+        let mut best_idx: Option<usize> = None;
+        let mut best_score = f32::NEG_INFINITY;
+        for (i, crystal) in crystals.iter().enumerate() {
+            if crystal.is_pinned(now) {
+                continue;
+            }
+            let sim = SpatialEngine::cosine_similarity(&percept.feature, &crystal.centroid);
+            let weight = decay.calculate_weight(crystal.count, crystal.last_access, now);
+            let weighted_score = sim * (1.0 + weight.ln().max(0.0));
+            if weighted_score > best_score {
+                best_score = weighted_score;
+                best_idx = Some(i);
+            }
+        }
+        if let Some(idx) = best_idx {
+            let crystal = &mut crystals[idx];
+            let sim = SpatialEngine::cosine_similarity(&percept.feature, &crystal.centroid);
+            if sim >= similarity_threshold {
+                let old_centroid = crystal.centroid.clone();
+                let new_centroid = SpatialEngine::incremental_mean(
+                    &old_centroid,
+                    crystal.count,
+                    &percept.feature,
+                );
+                let residual = SpatialEngine::residual(&percept.feature, &new_centroid);
+                let residual_norm = SpatialEngine::l2_norm(&residual);
+                crystal.centroid = new_centroid;
+                crystal.count += 1;
+                crystal.last_access = now;
+                crystal.anomaly_score = crystal.anomaly_score.max(residual_norm);
+                crystal.has_residual = true;
+                crystal.compression_ratio = (crystal.count as f32).log2();
+                crystal.update_quality();
+                return true;
+            }
+        }
+        let new_crystal = MemoryCrystal::from_consciousness(percept);
+        crystals.push(new_crystal);
+        false
+    }
+    pub fn add_crystal(&self, crystal: MemoryCrystal) {
+        self.crystals.write().push(crystal);
+    }
+    pub fn count(&self) -> usize {
+        self.crystals.read().len()
+    }
+    pub fn clear(&self) {
+        self.crystals.write().clear();
+    }
+    pub fn retain<F>(&self, mut f: F)
+    where
+        F: FnMut(&MemoryCrystal) -> bool,
+    {
+        self.crystals.write().retain(|c| f(c));
+    }
+}
+// ============================================================
+// 时间回声（只读快照）
+// ============================================================
+#[derive(Clone)]
+pub struct TemporalEcho {
+    shards: Arc<Vec<Arc<Vec<MemoryCrystal>>>>,
+    created_at: CosmicTimestamp,
+    pub version: u64,
+    pub total_count: usize,
+}
+impl TemporalEcho {
+    pub fn from_shards(shards: &[Arc<DimensionalShard>], version: u64) -> Self {
+        let mut shard_snapshots: Vec<Arc<Vec<MemoryCrystal>>> = Vec::with_capacity(shards.len());
+        let mut total = 0;
+        for shard in shards {
+            let snapshot = shard.snapshot();
+            total += snapshot.len();
+            shard_snapshots.push(Arc::new(snapshot));
+        }
+        Self {
+            shards: Arc::new(shard_snapshots),
+            created_at: CosmicTimestamp::now(),
+            version,
+            total_count: total,
+        }
+    }
+    pub fn iter_all(&self) -> impl ParallelIterator<Item = MemoryCrystal> + '_ {
+        self.shards.par_iter().flat_map(|arc_vec| {
+            arc_vec.par_iter().cloned()
+        })
+    }
+    pub fn age(&self, now: CosmicTimestamp) -> Duration {
+        now.elapsed_since(self.created_at)
+    }
+}
+// ============================================================
+// 空间导航器（向量索引）
+// ============================================================
+pub trait SpatialNavigator: Send + Sync {
+    fn add(&self, id: Uuid, vector: &[f32]) -> EidosResult<()>;
+    fn remove(&self, id: &Uuid) -> EidosResult<()>;
+    fn search(&self, vector: &[f32], top_k: usize) -> EidosResult<Vec<(Uuid, f32)>>;
+    fn rebuild(&self, items: &[(Uuid, Vec<f32>)]) -> EidosResult<()>;
+    fn size(&self) -> usize;
+    fn name(&self) -> &'static str;
+}
+/// 线性索引 — 快照式无锁读，适合中等规模
+pub struct LinearNavigator {
+    snapshot: RwLock<Arc<Vec<(Uuid, Vec<f32>)>>>,
+}
+impl LinearNavigator {
+    pub fn new() -> Self {
+        Self {
+            snapshot: RwLock::new(Arc::new(Vec::new()))
+        }
+    }
+    fn get_snapshot(&self) -> Arc<Vec<(Uuid, Vec<f32>)>> {
+        self.snapshot.read().clone()
+    }
+    fn replace_snapshot(&self, new: Vec<(Uuid, Vec<f32>)>) {
+        *self.snapshot.write() = Arc::new(new);
+    }
+}
+impl Default for LinearNavigator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl SpatialNavigator for LinearNavigator {
+    fn add(&self, id: Uuid, vector: &[f32]) -> EidosResult<()> {
+        let old = self.get_snapshot();
+        let vec_data = vector.to_vec();
+        let mut new = Vec::with_capacity(old.len() + 1);
+        let mut replaced = false;
+        for (eid, evec) in old.iter() {
+            if eid == &id {
+                new.push((id, vec_data.clone()));
+                replaced = true;
+            } else {
+                new.push((*eid, evec.clone()));
+            }
+        }
+        if !replaced {
+            new.push((id, vec_data));
+        }
+        self.replace_snapshot(new);
+        Ok(())
+    }
+    fn remove(&self, id: &Uuid) -> EidosResult<()> {
+        let old = self.get_snapshot();
+        let new: Vec<_> = old.iter()
+            .filter(|(eid, _)| eid != id)
+            .map(|(eid, v)| (*eid, v.clone()))
+            .collect();
+        self.replace_snapshot(new);
+        Ok(())
+    }
+    fn search(&self, vector: &[f32], top_k: usize) -> EidosResult<Vec<(Uuid, f32)>> {
+        let snap = self.get_snapshot();
+        let norm_b = SpatialEngine::l2_norm(vector);
+        if norm_b == 0.0 {
+            return Ok(Vec::new());
+        }
+        let mut scored: Vec<(Uuid, f32)> = snap.par_iter()
+            .filter_map(|(id, v)| {
+                let norm_a = SpatialEngine::l2_norm(v);
+                if norm_a == 0.0 {
+                    return None;
+                }
+                let sim = SpatialEngine::cosine_similarity(v, vector);
+                Some((*id, sim))
+            })
+            .collect();
+        SpatialEngine::top_k_by_score(&mut scored, top_k);
+        Ok(scored)
+    }
+    fn rebuild(&self, items: &[(Uuid, Vec<f32>)]) -> EidosResult<()> {
+        let new_data: Vec<(Uuid, Vec<f32>)> = items.to_vec();
+        self.replace_snapshot(new_data);
+        Ok(())
+    }
+    fn size(&self) -> usize {
+        self.get_snapshot().len()
+    }
+    fn name(&self) -> &'static str {
+        "linear"
+    }
+}
+// ============================================================
+// 指标与可观测性
+// ============================================================
+pub struct EidosMetrics {
+    pub registry: Registry,
+    pub wal_appends: IntCounterVec,
+    pub wal_replayed: IntCounterVec,
+    pub wal_invalid: IntCounterVec,
+    pub wal_checkpoints: IntCounterVec,
+    pub crystal_stores: IntCounterVec,
+    pub oplog_appends: IntCounterVec,
+    pub recall_requests: IntCounterVec,
+    pub recall_levels_observed: IntCounterVec,
+    pub ingested: IntCounter,
+    pub merges: IntCounter,
+    pub compactions: IntCounter,
+    pub queries: IntCounter,
+    pub crystal_count: IntGauge,
+    pub residual_count: IntGauge,
+    pub active_workers: IntGauge,
+    pub query_errors: IntCounter,
+    pub persist_errors: IntCounter,
+    pub op_latency: HistogramVec,
+    pub compaction_duration: Histogram,
+}
+impl EidosMetrics {
+    pub fn new() -> Self {
+        let registry = Registry::new();
+        let wal_appends = IntCounterVec::new(
+            prometheus::Opts::new("eidos_wal_appends_total", "WAL appends"),
+            &["result"]
+        ).unwrap();
+        let wal_replayed = IntCounterVec::new(
+            prometheus::Opts::new("eidos_wal_replayed_total", "WAL replayed"),
+            &["type"]
+        ).unwrap();
+        let wal_invalid = IntCounterVec::new(
+            prometheus::Opts::new("eidos_wal_invalid_total", "WAL invalid"),
+            &["reason"]
+        ).unwrap();
+        let wal_checkpoints = IntCounterVec::new(
+            prometheus::Opts::new("eidos_wal_checkpoints_total", "WAL checkpoints"),
+            &["note"]
+        ).unwrap();
+        let crystal_stores = IntCounterVec::new(
+            prometheus::Opts::new("eidos_crystal_stores_total", "crystal stores"),
+            &["result"]
+        ).unwrap();
+        let oplog_appends = IntCounterVec::new(
+            prometheus::Opts::new("eidos_oplog_appends_total", "oplog appends"),
+            &["severity"]
+        ).unwrap();
+        let recall_requests = IntCounterVec::new(
+            prometheus::Opts::new("eidos_recall_requests_total", "recall requests"),
+            &["status"]
+        ).unwrap();
+        let recall_levels_observed = IntCounterVec::new(
+            prometheus::Opts::new("eidos_recall_levels_observed_total", "recall levels observed"),
+            &["level"]
+        ).unwrap();
+        let ingested = IntCounter::new("eidos_ingested_total", "Total percepts ingested").unwrap();
+        let merges = IntCounter::new("eidos_merges_total", "Total merges performed").unwrap();
+        let compactions = IntCounter::new("eidos_compactions_total", "Total compactions executed").unwrap();
+        let queries = IntCounter::new("eidos_queries_total", "Total queries executed").unwrap();
+        let crystal_count = IntGauge::new("eidos_crystal_count", "Current number of memory crystals").unwrap();
+        let residual_count = IntGauge::new("eidos_residual_count", "Current number of stored residuals").unwrap();
+        let active_workers = IntGauge::new("eidos_active_workers", "Active worker count").unwrap();
+        let query_errors = IntCounter::new("eidos_query_errors_total", "Total query errors").unwrap();
+        let persist_errors = IntCounter::new("eidos_persist_errors_total", "Total persistence errors").unwrap();
+        let op_latency = HistogramVec::new(
+            HistogramOpts::new("eidos_op_latency_seconds", "operation latency seconds"),
+            &["op"]
+        ).unwrap();
+        let compaction_duration = Histogram::with_opts(
+            HistogramOpts::new("eidos_compaction_duration_seconds", "Compaction duration in seconds")
+        ).unwrap();
+        registry.register(Box::new(wal_appends.clone())).unwrap();
+        registry.register(Box::new(wal_replayed.clone())).unwrap();
+        registry.register(Box::new(wal_invalid.clone())).unwrap();
+        registry.register(Box::new(wal_checkpoints.clone())).unwrap();
+        registry.register(Box::new(crystal_stores.clone())).unwrap();
+        registry.register(Box::new(oplog_appends.clone())).unwrap();
+        registry.register(Box::new(recall_requests.clone())).unwrap();
+        registry.register(Box::new(recall_levels_observed.clone())).unwrap();
+        registry.register(Box::new(ingested.clone())).unwrap();
+        registry.register(Box::new(merges.clone())).unwrap();
+        registry.register(Box::new(compactions.clone())).unwrap();
+        registry.register(Box::new(queries.clone())).unwrap();
+        registry.register(Box::new(crystal_count.clone())).unwrap();
+        registry.register(Box::new(residual_count.clone())).unwrap();
+        registry.register(Box::new(active_workers.clone())).unwrap();
+        registry.register(Box::new(query_errors.clone())).unwrap();
+        registry.register(Box::new(persist_errors.clone())).unwrap();
+        registry.register(Box::new(op_latency.clone())).unwrap();
+        registry.register(Box::new(compaction_duration.clone())).unwrap();
+        Self {
+            registry,
+            wal_appends,
+            wal_replayed,
+            wal_invalid,
+            wal_checkpoints,
+            crystal_stores,
+            oplog_appends,
+            recall_requests,
+            recall_levels_observed,
+            ingested,
+            merges,
+            compactions,
+            queries,
+            crystal_count,
+            residual_count,
+            active_workers,
+            query_errors,
+            persist_errors,
+            op_latency,
+            compaction_duration,
+        }
+    }
+    pub fn gather_prometheus(&self) -> String {
+        let encoder = TextEncoder::new();
+        let metric_families = self.registry.gather();
+        let mut buffer = Vec::new();
+        encoder.encode(&metric_families, &mut buffer).unwrap();
+        String::from_utf8(buffer).unwrap()
+    }
+    pub fn observe_ingest_duration(&self, duration: Duration) {
+        self.op_latency.with_label_values(&["ingest"]).observe(duration.as_secs_f64());
+    }
+    pub fn observe_query_duration(&self, duration: Duration) {
+        self.op_latency.with_label_values(&["query"]).observe(duration.as_secs_f64());
+    }
+}
+impl Default for EidosMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+// ============================================================
+// 安全与认证（JWT + RBAC）
+// ============================================================
+#[derive(Debug, Serialize, Deserialize)]
+pub struct JwtClaims {
+    pub sub: String,
+    pub exp: usize,
+    pub roles: Vec<String>,
+    pub scope: Option<String>,
+}
+pub struct Authenticator {
+    decoding_key: DecodingKey,
+    validation: Validation,
+    pub role_map: RwLock<HashMap<String, Vec<String>>>,
+}
+impl Authenticator {
+    pub fn new_hs256(secret: &[u8]) -> Self {
+        let decoding_key = DecodingKey::from_secret(secret);
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.validate_exp = true;
+        Self {
+            decoding_key,
+            validation,
+            role_map: RwLock::new(HashMap::new()),
+        }
+    }
+    pub fn verify_token(&self, token: &str) -> EidosResult<TokenData<JwtClaims>> {
+        Ok(decode::<JwtClaims>(token, &self.decoding_key, &self.validation)?)
+    }
+    pub fn authorize(&self, claims: &JwtClaims, action: &str) -> bool {
+        for role in &claims.roles {
+            if let Some(allowed) = self.role_map.read().get(role) {
+                if allowed.contains(&action.to_string()) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    pub fn set_role_permissions(&self, role: &str, actions: Vec<String>) {
+        self.role_map.write().insert(role.to_string(), actions);
+    }
+}
+// ============================================================
+// 配置管理与热重载
+// ============================================================
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EidosConfig {
+    pub data_path: String,
+    pub max_concurrent_ops: usize,
+    pub residual_compressor: String,
+    pub jwt_secret_b64: Option<String>,
+    pub metrics_bind: String,
+    pub auth_enabled: bool,
+    pub decay_strategy: String,
+    pub compaction_threshold: f32,
+    pub residual_levels: u8,
+    pub shard_count: usize,
+    pub similarity_threshold: f32,
+    pub max_crystals: usize,
+    pub persist_enabled: bool,
+    pub http_addr: String,
+    pub grpc_addr: Option<String>,
+    pub grpc_token: Option<String>,
+    pub ingest_buffer: usize,
+    pub compaction_strategy: CompactionStrategy,
+    pub navigator_type: NavigatorType,
+    pub exponential_half_life_hours: f64,
+    pub adaptive_alpha: f64,
+    pub adaptive_min_half_life: f64,
+    pub adaptive_max_half_life: f64,
+    pub residual_projection_dim: Option<usize>,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CompactionStrategy {
+    OnDemand,
+    Periodic { interval_secs: u64 },
+    Continuous,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum NavigatorType {
+    Linear,
+    Hnsw { dim: usize, max_neighbors: usize },
+}
+impl Default for EidosConfig {
+    fn default() -> Self {
+        Self::production()
+    }
+}
+impl EidosConfig {
+    pub fn development() -> Self {
+        Self {
+            data_path: "./eidos_dev.db".to_string(),
+            max_concurrent_ops: 8,
+            residual_compressor: "identity".to_string(),
+            jwt_secret_b64: None,
+            metrics_bind: "127.0.0.1:9000".to_string(),
+            auth_enabled: false,
+            decay_strategy: "logarithmic".to_string(),
+            compaction_threshold: 0.80,
+            residual_levels: 2,
+            shard_count: 4,
+            similarity_threshold: 0.80,
+            max_crystals: 1000,
+            persist_enabled: true,
+            http_addr: "127.0.0.1:9090".to_string(),
+            grpc_addr: None,
+            grpc_token: None,
+            ingest_buffer: 1024,
+            compaction_strategy: CompactionStrategy::OnDemand,
+            navigator_type: NavigatorType::Linear,
+            exponential_half_life_hours: 24.0,
+            adaptive_alpha: 0.2,
+            adaptive_min_half_life: 1.0,
+            adaptive_max_half_life: 48.0,
+            residual_projection_dim: None,
+        }
+    }
+    pub fn production() -> Self {
+        Self {
+            data_path: "/var/lib/eidos/vault".to_string(),
+            max_concurrent_ops: 32,
+            residual_compressor: "quantize8".to_string(),
+            jwt_secret_b64: None,
+            metrics_bind: "0.0.0.0:9000".to_string(),
+            auth_enabled: false,
+            decay_strategy: "adaptive".to_string(),
+            compaction_threshold: 0.85,
+            residual_levels: 3,
+            shard_count: 16,
+            similarity_threshold: 0.85,
+            max_crystals: 100_000,
+            persist_enabled: true,
+            http_addr: "0.0.0.0:9090".to_string(),
+            grpc_addr: Some("0.0.0.0:9091".to_string()),
+            grpc_token: None,
+            ingest_buffer: 4096,
+            compaction_strategy: CompactionStrategy::Periodic { interval_secs: 300 },
+            navigator_type: NavigatorType::Linear,
+            exponential_half_life_hours: 24.0,
+            adaptive_alpha: 0.2,
+            adaptive_min_half_life: 1.0,
+            adaptive_max_half_life: 48.0,
+            residual_projection_dim: Some(64),
+        }
+    }
+    pub fn high_throughput() -> Self {
+        Self {
+            data_path: "./eidos_throughput.db".to_string(),
+            max_concurrent_ops: 64,
+            residual_compressor: "quantize8".to_string(),
+            jwt_secret_b64: None,
+            metrics_bind: "0.0.0.0:9000".to_string(),
+            auth_enabled: false,
+            decay_strategy: "logarithmic".to_string(),
+            compaction_threshold: 0.75,
+            residual_levels: 2,
+            shard_count: 64,
+            similarity_threshold: 0.75,
+            max_crystals: 1_000_000,
+            persist_enabled: true,
+            http_addr: "0.0.0.0:9090".to_string(),
+            grpc_addr: Some("0.0.0.0:9091".to_string()),
+            grpc_token: None,
+            ingest_buffer: 16384,
+            compaction_strategy: CompactionStrategy::Continuous,
+            navigator_type: NavigatorType::Linear,
+            exponential_half_life_hours: 24.0,
+            adaptive_alpha: 0.2,
+            adaptive_min_half_life: 1.0,
+            adaptive_max_half_life: 48.0,
+            residual_projection_dim: Some(32),
+        }
+    }
+    pub fn memory_constrained() -> Self {
+        Self {
+            data_path: "./eidos_small.db".to_string(),
+            max_concurrent_ops: 4,
+            residual_compressor: "quantize8".to_string(),
+            jwt_secret_b64: None,
+            metrics_bind: "127.0.0.1:9000".to_string(),
+            auth_enabled: false,
+            decay_strategy: "logarithmic".to_string(),
+            compaction_threshold: 0.90,
+            residual_levels: 1,
+            shard_count: 8,
+            similarity_threshold: 0.90,
+            max_crystals: 10_000,
+            persist_enabled: true,
+            http_addr: "127.0.0.1:9090".to_string(),
+            grpc_addr: None,
+            grpc_token: None,
+            ingest_buffer: 512,
+            compaction_strategy: CompactionStrategy::OnDemand,
+            navigator_type: NavigatorType::Linear,
+            exponential_half_life_hours: 24.0,
+            adaptive_alpha: 0.2,
+            adaptive_min_half_life: 1.0,
+            adaptive_max_half_life: 48.0,
+            residual_projection_dim: Some(16),
+        }
+    }
+    pub fn create_decay_strategy(&self) -> Box<dyn DecayStrategy> {
+        match self.decay_strategy.as_str() {
+            "logarithmic" => Box::new(LogarithmicDecay),
+            "exponential" => Box::new(ExponentialDecay { half_life_hours: self.exponential_half_life_hours }),
+            "adaptive" => Box::new(AdaptiveDecay::new(
+                self.adaptive_alpha,
+                self.adaptive_min_half_life,
+                self.adaptive_max_half_life,
+            )),
+            _ => Box::new(LogarithmicDecay),
+        }
+    }
+    pub fn validate(&self) -> EidosResult<()> {
+        if self.data_path.is_empty() {
+            return Err(EidosError::Configuration("data_path empty".into()));
+        }
+        if self.max_concurrent_ops == 0 {
+            return Err(EidosError::Configuration("max_concurrent_ops must be > 0".into()));
+        }
+        if !(0.0..=1.0).contains(&self.compaction_threshold) {
+            return Err(EidosError::Configuration("compaction_threshold must be in [0,1]".into()));
+        }
+        Ok(())
+    }
+}
+pub struct ConfigManager {
+    path: PathBuf,
+    current: RwLock<EidosConfig>,
+    watcher: Mutex<Option<RecommendedWatcher>>,
+    history: Mutex<Vec<EidosConfig>>,
+}
+impl ConfigManager {
+    pub fn load_from_file(path: impl AsRef<Path>) -> EidosResult<Self> {
+        let path = path.as_ref().to_path_buf();
+        let raw = std::fs::read_to_string(&path).map_err(|e| EidosError::Configuration(e.to_string()))?;
+        let cfg: EidosConfig = serde_json::from_str(&raw).map_err(|e| EidosError::Configuration(e.to_string()))?;
+        cfg.validate()?;
+        Ok(Self {
+            path,
+            current: RwLock::new(cfg.clone()),
+            watcher: Mutex::new(None),
+            history: Mutex::new(vec![cfg]),
+        })
+    }
+    pub fn start_hot_reload<F>(&self, on_change: F) -> EidosResult<()>
+    where
+        F: Fn(EidosConfig) + Send + 'static,
+    {
+        let path = self.path.clone();
+        let cm = Arc::new(RwLock::new(self.current.read().clone()));
+        let hist = Arc::new(Mutex::new(self.history.lock().clone()));
+        let mut watcher: RecommendedWatcher = RecommendedWatcher::new(
+            move |res: Result<Event, notify::Error>| {
+                match res {
+                    Ok(event) => {
+                        if event.kind.is_modify() {
+                            if let Ok(raw) = std::fs::read_to_string(&path) {
+                                if let Ok(cfg) = serde_json::from_str::<EidosConfig>(&raw) {
+                                    if cfg.validate().is_ok() {
+                                        *cm.write() = cfg.clone();
+                                        hist.lock().push(cfg.clone());
+                                        on_change(cfg);
+                                    } else {
+                                        warn!("config validation failed on hot reload");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => warn!("watcher error: {:?}", e),
+                }
+            },
+            notify::Config::default(),
+        ).map_err(|e| EidosError::Configuration(e.to_string()))?;
+        watcher.watch(&self.path, RecursiveMode::NonRecursive)
+            .map_err(|e| EidosError::Configuration(e.to_string()))?;
+        *self.watcher.lock() = Some(watcher);
+        Ok(())
+    }
+    pub fn current(&self) -> EidosConfig {
+        self.current.read().clone()
+    }
+    pub fn rollback(&self) -> EidosResult<()> {
+        let mut hist = self.history.lock();
+        if hist.len() < 2 {
+            return Err(EidosError::Configuration("no previous config to rollback".into()));
+        }
+        hist.pop();
+        let prev = hist.last().unwrap().clone();
+        *self.current.write() = prev;
+        Ok(())
+    }
+}
+// ============================================================
+// 资源控制与背压
+// ============================================================
+pub struct ResourceController {
+    pub max_memory_bytes: u64,
+    pub memory_check_interval: Duration,
+    vault: Arc<TemporalVault>,
+}
+impl ResourceController {
+    pub fn new(max_memory_bytes: u64, interval: Duration, vault: Arc<TemporalVault>) -> Self {
+        Self {
+            max_memory_bytes,
+            memory_check_interval: interval,
+            vault,
+        }
+    }
+    pub fn monitor_and_throttle(&self) {
+        let vault = self.vault.clone();
+        let max = self.max_memory_bytes;
+        let interval = self.memory_check_interval;
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(interval);
+                let mut total = 0u64;
+                if let Ok(len) = vault.crystal_count() {
+                    total += len as u64 * 256; // 估算每个水晶占用256字节
+                }
+                let residuals = vault.metrics.residual_count.get();
+                total += residuals as u64 * 128; // 估算每个残差占用128字节
+                if total > max {
+                    warn!("resource controller: estimated usage {} > max {}", total, max);
+                    // 这里可以添加实际的节流逻辑
+                }
+            }
+        });
+    }
+}
+// ============================================================
+// Schema迁移
+// ============================================================
+type MigrationFn = Box<dyn Fn(&sled::Db) -> Result<(), String> + Send + Sync>;
+pub struct SchemaMigrator {
+    migrations: Vec<(u32, MigrationFn)>,
+}
+impl SchemaMigrator {
+    pub fn new() -> Self {
+        Self { migrations: Vec::new() }
+    }
+    pub fn register<F>(&mut self, version: u32, f: F)
+    where
+        F: Fn(&sled::Db) -> Result<(), String> + Send + Sync + 'static,
+    {
+        self.migrations.push((version, Box::new(f)));
+        self.migrations.sort_by_key(|(v, _)| *v);
+    }
+    pub fn run(&self, db: &sled::Db, current_version: u32) -> Result<u32, String> {
+        let mut v = current_version;
+        for (mv, f) in &self.migrations {
+            if *mv > v {
+                f(db)?;
+                v = *mv;
+            }
+        }
+        Ok(v)
+    }
+}
+impl Default for SchemaMigrator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+// ============================================================
+// 压缩执行器
+// ============================================================
+#[allow(dead_code)]
+pub struct CompactionExecutor {
+    db: sled::Db,
+    crystals_tree: sled::Tree,
+    compaction_tree: sled::Tree,
+    oplog_tree: sled::Tree,
+    residual_store: Arc<dyn AdvancedResidualStore>,
+}
+impl CompactionExecutor {
+    pub fn open(db: sled::Db, residual_store: Arc<dyn AdvancedResidualStore>) -> EidosResult<Self> {
+        let crystals_tree = db.open_tree("crystals_v3")?;
+        let compaction_tree = db.open_tree("compaction_plans_v3")?;
+        let oplog_tree = db.open_tree("oplog_v3")?;
+        Ok(Self {
+            db,
+            crystals_tree,
+            compaction_tree,
+            oplog_tree,
+            residual_store,
+        })
+    }
+    /// 贪婪聚类dry-run
+    pub fn plan_dry_run(&self, candidates: &[MemoryCrystal], similarity_threshold: f32) -> EidosResult<CompactionPlan> {
+        let mut used = vec![false; candidates.len()];
+        let mut outputs = Vec::new();
+        for i in 0..candidates.len() {
+            if used[i] {
+                continue;
+            }
+            let mut base = candidates[i].clone();
+            let mut merged_ids = vec![base.id];
+            for j in (i + 1)..candidates.len() {
+                if used[j] {
+                    continue;
+                }
+                let sim = SpatialEngine::cosine_similarity(&base.centroid, &candidates[j].centroid);
+                if sim >= similarity_threshold {
+                    let _total_count = base.count + candidates[j].count;
+                    let new_centroid = SpatialEngine::weighted_mean(
+                        &base.centroid,
+                        base.count as f64,
+                        &candidates[j].centroid,
+                        candidates[j].count as f64,
+                    );
+                    base.centroid = new_centroid;
+                    base.lineage = match base.lineage {
+                        None => Some(vec![candidates[j].id]),
+                        Some(mut v) => {
+                            v.push(candidates[j].id);
+                            Some(v)
+                        }
+                    };
+                    merged_ids.push(candidates[j].id);
+                    used[j] = true;
+                }
+            }
+            outputs.push(base);
+        }
+        let inputs: Vec<Uuid> = candidates.iter().map(|c| c.id).collect();
+        Ok(CompactionPlan::new("dry_run_greedy", inputs, outputs, true))
+    }
+}
+// ============================================================
+// 异步摄入服务
+// ============================================================
+pub struct IngestService {
+    sender: tokio::sync::mpsc::Sender<ConsciousnessStream>,
+    #[allow(dead_code)]
+    metrics: Arc<EidosMetrics>,
+}
+impl IngestService {
+    pub fn new(
+        orchestrator: Arc<CognitiveOrchestrator>,
+        buffer: usize,
+        metrics: Arc<EidosMetrics>,
+    ) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(buffer);
+        let metrics_clone = metrics.clone();
+        tokio::spawn(async move {
+            while let Some(percept) = rx.recv().await {
+                let orchestrator = orchestrator.clone();
+                let metrics = metrics_clone.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = orchestrator.ingest(percept) {
+                        error!("Ingest failed: {:?}", e);
+                        metrics.persist_errors.inc();
+                    }
+                })
+                .await
+                .ok();
+            }
+            info!("Ingest worker exited");
+        });
+        Self {
+            sender: tx,
+            metrics,
+        }
+    }
+    pub async fn ingest(&self, percept: ConsciousnessStream) -> EidosResult<()> {
+        self.sender
+            .send(percept)
+            .await
+            .map_err(|e| EidosError::Internal(format!("Ingest channel closed: {}", e)))
+    }
+    pub fn pending_count(&self) -> usize {
+        0 // Sender 没有 len 方法，返回0或使用其他方式追踪
+    }
+}
+// ============================================================
+// 认知编排器
+// ============================================================
+pub struct CognitiveOrchestrator {
+    vault: Arc<TemporalVault>,
+    residual_store: Arc<dyn AdvancedResidualStore>,
+    recall_manager: Arc<RecallManager>,
+    shards: Vec<Arc<DimensionalShard>>,
+    echo: Arc<RwLock<Arc<TemporalEcho>>>,
+    navigator: Arc<dyn SpatialNavigator>,
+    config: EidosConfig,
+    metrics: Arc<EidosMetrics>,
+    decay: Box<dyn DecayStrategy>,
+    echo_version: Arc<Mutex<u64>>,
+}
+impl CognitiveOrchestrator {
+    pub fn initialize(
+        vault: TemporalVault,
+        residual_store: Arc<dyn AdvancedResidualStore>,
+        recall_manager: Arc<RecallManager>,
+        config: EidosConfig,
+        metrics: Arc<EidosMetrics>,
+    ) -> EidosResult<Self> {
+        let vault = Arc::new(vault);
+        // 恢复WAL
+        let recovery_report = vault.recover_from_wal()?;
+        if recovery_report.recovered_plans > 0 {
+            info!("Recovered {} WAL records", recovery_report.recovered_plans);
+        }
+        if !recovery_report.errors.is_empty() {
+            warn!("WAL recovery had {} errors", recovery_report.errors.len());
+            for err in &recovery_report.errors {
+                warn!("WAL error: {}", err);
+            }
+        }
+        // 初始化分片
+        let mut shards: Vec<Arc<DimensionalShard>> = Vec::with_capacity(config.shard_count);
+        for i in 0..config.shard_count {
+            shards.push(Arc::new(DimensionalShard::new(i)));
+        }
+        // 加载现有水晶
+        let existing_crystals = vault.iterate_crystals()?;
+        for (i, crystal) in existing_crystals.into_iter().enumerate() {
+            let shard_idx = i % config.shard_count;
+            shards[shard_idx].add_crystal(crystal);
+        }
+        // 初始化时间回声
+        let initial_echo = TemporalEcho::from_shards(&shards, 1);
+        metrics.crystal_count.set(initial_echo.total_count as i64);
+        metrics.residual_count.set(residual_store.count_chunks()? as i64);
+        // 初始化向量索引
+        let navigator: Arc<dyn SpatialNavigator> = Arc::new(LinearNavigator::new());
+        let index_items: Vec<(Uuid, Vec<f32>)> = initial_echo
+            .iter_all()
+            .map(|c| (c.id, c.centroid.clone()))
+            .collect();
+        navigator.rebuild(&index_items)?;
+        // 创建衰减策略
+        let decay = config.create_decay_strategy();
+        info!("CognitiveOrchestrator initialized with {} shards, {} crystals",
+            config.shard_count, initial_echo.total_count);
+        Ok(Self {
+            vault,
+            residual_store,
+            recall_manager,
+            shards,
+            echo: Arc::new(RwLock::new(Arc::new(initial_echo))),
+            navigator,
+            config,
+            metrics,
+            decay,
+            echo_version: Arc::new(Mutex::new(1)),
+        })
+    }
+    pub fn ingest(&self, percept: ConsciousnessStream) -> EidosResult<IngestResult> {
+        let start = Instant::now();
+        let now = CosmicTimestamp::now();
+        let shard_idx = self.select_shard(&percept.id);
+        let shard = &self.shards[shard_idx];
+        let merged = shard.ingest_local(&percept, self.config.similarity_threshold, now, &*self.decay);
+        if merged {
+            let crystals = shard.snapshot();
+            self.vault.batch_store_crystals(&crystals)?;
+            self.metrics.merges.inc();
+            // 存储残差
+            if let Some(crystal) = crystals.last() {
+                if crystal.has_residual {
+                    let residual = SpatialEngine::residual(&percept.feature, &crystal.centroid);
+                    let compressor = IdentityCompressor;
+                    let compressed = compressor.compress(&residual)?;
+                    self.residual_store.store_chunk(&crystal.id, 0, &compressed, compressor.name(), compressor.version())?;
+                    self.metrics.residual_count.set(self.residual_store.count_chunks()? as i64);
+                }
+            }
+        } else {
+            let crystals = shard.snapshot();
+            if let Some(new_crystal) = crystals.last() {
+                self.vault.store_crystal(new_crystal)?;
+                self.navigator.add(new_crystal.id, &new_crystal.centroid)?;
+            }
+        }
+        let total_count = self.echo.read().total_count;
+        if total_count > self.config.max_crystals * 2 {
+            self.trigger_echo_rebuild();
+        }
+        let duration = start.elapsed();
+        self.metrics.observe_ingest_duration(duration);
+        self.metrics.crystal_count.set(self.crystal_count() as i64);
+        let op_log = OperationLog::new(
+            "ingest",
+            serde_json::json!({
+                "percept_id": percept.id.to_string(),
+                "merged": merged,
+                "shard": shard_idx,
+            }),
+        ).with_duration(duration);
+        let _ = self.vault.append_oplog(&op_log);
+        Ok(IngestResult {
+            merged,
+            shard_idx,
+            duration,
+        })
+    }
+    pub fn recall(
+        &self,
+        query_vector: &[f32],
+        top_k: usize,
+        include_residuals: bool,
+    ) -> EidosResult<Vec<RecallResult>> {
+        let start = Instant::now();
+        let now = CosmicTimestamp::now();
+        let echo = self.echo.read().clone();
+        let mut scored: Vec<(Uuid, f32)> = echo
+            .shards
+            .par_iter()
+            .flat_map(|shard_data| {
+                shard_data.par_iter().map(|crystal| {
+                    let sim = SpatialEngine::cosine_similarity(query_vector, &crystal.centroid);
+                    let weight = self.decay.calculate_weight(crystal.count, crystal.last_access, now);
+                    let weighted = sim * (1.0 + weight.ln().max(0.0));
+                    (crystal.id, weighted)
+                })
+            })
+            .collect();
+        SpatialEngine::top_k_by_score(&mut scored, top_k);
+        scored.truncate(top_k);
+        let mut results = Vec::with_capacity(scored.len());
+        for (id, _) in scored {
+            if let Some(crystal) = self.vault.retrieve_crystal(&id)? {
+                let mut reconstructed = crystal.centroid.clone();
+                let mut used_levels = Vec::new();
+                let mut quality = 0.5f32;
+                if include_residuals && crystal.has_residual {
+                    // 使用渐进式残差重建
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    let recall_req = RecallRequest {
+                        crystal_id: id,
+                        target_quality: 0.9,
+                        timeout: Duration::from_secs(1),
+                        trace_id: None,
+                    };
+                    let recall_result = rt.block_on(self.recall_manager.recall(recall_req, &crystal.centroid))?;
+                    reconstructed = recall_result.reconstructed;
+                    used_levels = recall_result.used_levels;
+                    quality = recall_result.quality;
+                }
+                results.push(RecallResult {
+                    crystal_id: id,
+                    reconstructed,
+                    quality,
+                    used_levels,
+                    duration_ms: start.elapsed().as_millis(),
+                });
+            }
+        }
+        let duration = start.elapsed();
+        self.metrics.observe_query_duration(duration);
+        self.metrics.queries.inc();
+        Ok(results)
+    }
+    pub fn force_compaction(&self) -> EidosResult<CompactionReport> {
+        let start = Instant::now();
+        let now = CosmicTimestamp::now();
+        let mut total_inputs = 0;
+        let mut total_outputs = 0;
+        for shard in &self.shards {
+            let local_crystals = shard.snapshot();
+            if local_crystals.len() < 2 {
+                continue;
+            }
+            let n = local_crystals.len();
+            let mut pairs: Vec<(usize, usize, f32)> = Vec::with_capacity(n * (n - 1) / 2);
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    if local_crystals[i].is_pinned(now) || local_crystals[j].is_pinned(now) {
+                        continue;
+                    }
+                    let sim = SpatialEngine::cosine_similarity(
+                        &local_crystals[i].centroid,
+                        &local_crystals[j].centroid,
+                    );
+                    let freq_penalty = (local_crystals[i].count.min(local_crystals[j].count) as f32)
+                        .ln()
+                        .max(1.0);
+                    let merge_score = sim / freq_penalty;
+                    pairs.push((i, j, merge_score));
+                }
+            }
+            pairs.par_sort_unstable_by(|a, b| {
+                b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut merged = vec![false; n];
+            let mut new_crystals: Vec<MemoryCrystal> = Vec::new();
+            let mut merged_ids: Vec<Uuid> = Vec::new();
+            let mut residuals: HashMap<Uuid, Vec<f32>> = HashMap::new();
+            for (i, j, _score) in pairs {
+                if merged[i] || merged[j] {
+                    continue;
+                }
+                let total_count = local_crystals[i].count + local_crystals[j].count;
+                let new_centroid = SpatialEngine::weighted_mean(
+                    &local_crystals[i].centroid,
+                    local_crystals[i].count as f64,
+                    &local_crystals[j].centroid,
+                    local_crystals[j].count as f64,
+                );
+                let residual_i = SpatialEngine::residual(&local_crystals[i].centroid, &new_centroid);
+                let residual_j = SpatialEngine::residual(&local_crystals[j].centroid, &new_centroid);
+                let combined_residual: Vec<f32> = residual_i.iter().zip(residual_j.iter())
+                    .map(|(a, b)| a + b)
+                    .collect();
+                let mut merged_crystal = local_crystals[i].clone();
+                merged_crystal.centroid = new_centroid;
+                merged_crystal.count = total_count;
+                merged_crystal.last_access = now;
+                merged_crystal.anomaly_score = merged_crystal.anomaly_score.max(local_crystals[j].anomaly_score);
+                merged_crystal.has_residual = true;
+                merged_crystal.compression_ratio = (total_count as f32).log2();
+                merged_crystal.update_quality();
+                residuals.insert(merged_crystal.id, combined_residual);
+                new_crystals.push(merged_crystal);
+                merged_ids.push(local_crystals[j].id);
+                merged[j] = true;
+            }
+            if !new_crystals.is_empty() {
+                let plan = CompactionPlan::new(
+                    "forced_compaction",
+                    merged_ids.clone(),
+                    new_crystals.clone(),
+                    false,
+                );
+                self.vault.execute_compaction_plan(&plan)?;
+                // 存储合并后的残差
+                for crystal in &new_crystals {
+                    if let Some(residual) = residuals.get(&crystal.id) {
+                        let compressor = IdentityCompressor;
+                        let compressed = compressor.compress(residual)?;
+                        self.residual_store.store_chunk(&crystal.id, 0, &compressed, compressor.name(), compressor.version())?;
+                    }
+                }
+                shard.retain(|c| !merged_ids.contains(&c.id));
+                for crystal in &new_crystals {
+                    shard.add_crystal(crystal.clone());
+                }
+                total_inputs += merged_ids.len();
+                total_outputs += new_crystals.len();
+            }
+        }
+        self.rebuild_echo();
+        self.metrics.compactions.inc();
+        self.metrics.crystal_count.set(self.crystal_count() as i64);
+        self.metrics.residual_count.set(self.residual_store.count_chunks()? as i64);
+        let duration = start.elapsed();
+        self.metrics.compaction_duration.observe(duration.as_secs_f64());
+        info!("Compaction completed in {:?}: {} inputs -> {} outputs",
+            duration, total_inputs, total_outputs);
+        Ok(CompactionReport {
+            inputs_merged: total_inputs,
+            outputs_created: total_outputs,
+            space_saved: total_inputs.saturating_sub(total_outputs),
+            duration,
+        })
+    }
+    pub fn pin_crystal(&self, id: &Uuid, level: PinLevel, ttl_seconds: Option<u64>) -> EidosResult<bool> {
+        for shard in &self.shards {
+            let mut crystals = shard.crystals.write();
+            if let Some(crystal) = crystals.iter_mut().find(|c| &c.id == id) {
+                if let Some(ttl) = ttl_seconds {
+                    let expiration = CosmicTimestamp::from_datetime(
+                        Utc::now() + chrono::Duration::seconds(ttl as i64)
+                    );
+                    crystal.pin_until(level.clone(), expiration);
+                } else {
+                    crystal.pin_permanent(level.clone());
+                }
+                self.vault.store_crystal(crystal)?;
+                let op_log = OperationLog::new(
+                    "pin",
+                    serde_json::json!({
+                        "crystal_id": id.to_string(),
+                        "level": level.to_string(),
+                        "ttl_seconds": ttl_seconds,
+                    }),
+                );
+                let _ = self.vault.append_oplog(&op_log);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    pub fn unpin_crystal(&self, id: &Uuid) -> EidosResult<bool> {
+        for shard in &self.shards {
+            let mut crystals = shard.crystals.write();
+            if let Some(crystal) = crystals.iter_mut().find(|c| &c.id == id) {
+                crystal.unpin();
+                self.vault.store_crystal(crystal)?;
+                let op_log = OperationLog::new(
+                    "unpin",
+                    serde_json::json!({
+                        "crystal_id": id.to_string(),
+                    }),
+                );
+                let _ = self.vault.append_oplog(&op_log);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    fn select_shard(&self, id: &Uuid) -> usize {
+        use std::collections::hash_map::DefaultHasher;
+        let mut hasher = DefaultHasher::new();
+        id.hash(&mut hasher);
+        (hasher.finish() % self.config.shard_count as u64) as usize
+    }
+    fn trigger_echo_rebuild(&self) {
+        let shards_clone: Vec<Arc<DimensionalShard>> = self.shards.clone();
+        let echo_lock = self.echo.clone();
+        let metrics = self.metrics.clone();
+        let version_lock = self.echo_version.clone();
+        tokio::spawn(async move {
+            let mut version = version_lock.lock();
+            *version += 1;
+            let new_echo = TemporalEcho::from_shards(&shards_clone, *version);
+            let count = new_echo.total_count;
+            *echo_lock.write() = Arc::new(new_echo);
+            metrics.crystal_count.set(count as i64);
+            info!("Echo rebuilt asynchronously, version: {}", *version);
+        });
+    }
+    fn rebuild_echo(&self) {
+        let mut version = self.echo_version.lock();
+        *version += 1;
+        let new_echo = TemporalEcho::from_shards(&self.shards, *version);
+        let count = new_echo.total_count;
+        *self.echo.write() = Arc::new(new_echo);
+        self.metrics.crystal_count.set(count as i64);
+    }
+    pub fn crystal_count(&self) -> usize {
+        self.echo.read().total_count
+    }
+    pub fn vault(&self) -> &TemporalVault {
+        &self.vault
+    }
+    pub fn vault_arc(&self) -> Arc<TemporalVault> {
+        self.vault.clone()
+    }
+    pub fn metrics(&self) -> &EidosMetrics {
+        &self.metrics
+    }
+    pub fn residual_store(&self) -> &dyn AdvancedResidualStore {
+        &*self.residual_store
+    }
+}
+// ============================================================
+// 操作结果类型
+// ============================================================
+#[derive(Debug)]
+pub struct IngestResult {
+    pub merged: bool,
+    pub shard_idx: usize,
+    pub duration: Duration,
+}
+#[derive(Debug)]
+pub struct CompactionReport {
+    pub inputs_merged: usize,
+    pub outputs_created: usize,
+    pub space_saved: usize,
+    pub duration: Duration,
+}
+// ============================================================
+// HTTP守护进程
+// ============================================================
+#[derive(Debug, Deserialize)]
+struct IngestRequest {
+    pub id: Option<Uuid>,
+    pub feature: Vec<f32>,
+    pub metadata: Option<serde_json::Value>,
+    pub confidence: Option<f32>,
+    pub priority: Option<u8>,
+    pub provenance: Option<String>,
+    pub ttl_seconds: Option<u64>,
+}
+#[derive(Debug, Deserialize)]
+struct QueryRequest {
+    pub feature: Vec<f32>,
+    pub k: Option<usize>,
+    pub include_residuals: Option<bool>,
+}
+#[derive(Debug, Serialize)]
+struct QueryResponse {
+    pub results: Vec<RecallResult>,
+}
+#[derive(Debug, Deserialize, Default)]
+struct PinRequest {
+    pub level: Option<String>,
+    pub ttl_seconds: Option<u64>,
+}
+async fn handle_request(
+    req: Request<Body>,
+    eidos: Arc<Eidos>,
+    ingest: Arc<IngestService>,
+) -> Result<Response<Body>, Infallible> {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    match (method, path.as_str()) {
+        (Method::GET, "/health") => Ok(Response::new(Body::from("ok"))),
+        
+        (Method::GET, "/metrics") => {
+            let body = eidos.metrics().gather_prometheus();
+            Ok(Response::new(Body::from(body)))
+        }
+        
+        (Method::GET, "/status") => {
+            let status = serde_json::json!({
+                "crystal_count": eidos.crystal_count(),
+                "pending_ingest": ingest.pending_count(),
+                "avg_ingest_duration": eidos.metrics().ingested.get() as f64 / eidos.metrics().ingested.get() as f64,
+                "avg_query_duration": eidos.metrics().queries.get() as f64 / eidos.metrics().queries.get() as f64,
+                "residual_count": eidos.orchestrator.residual_store().count_chunks().unwrap_or(0),
+            });
+            let body = serde_json::to_string_pretty(&status).unwrap_or_default();
+            Ok(Response::new(Body::from(body)))
+        }
+        
+        (Method::POST, "/ingest") => {
+            let body = hyper::body::to_bytes(req.into_body()).await.unwrap_or_default();
+            match serde_json::from_slice::<IngestRequest>(&body) {
+                Ok(req) => {
+                    let mut percept = ConsciousnessStream::new(
+                        req.feature,
+                        req.metadata.unwrap_or(serde_json::json!({})),
+                    );
+                    if let Some(id) = req.id {
+                        percept.id = id;
+                    }
+                    if let Some(conf) = req.confidence {
+                        percept.confidence = conf.clamp(0.0, 1.0);
+                    }
+                    if let Some(prio) = req.priority {
+                        percept.priority = prio;
+                    }
+                    if let Some(prov) = req.provenance {
+                        percept.provenance = Some(prov);
+                    }
+                    if let Some(ttl) = req.ttl_seconds {
+                        percept.ttl_seconds = Some(ttl);
+                    }
+                    match ingest.ingest(percept).await {
+                        Ok(_) => {
+                            let resp = serde_json::json!({"ok": true});
+                            Ok(Response::new(Body::from(
+                                serde_json::to_string(&resp).unwrap_or_default(),
+                            )))
+                        }
+                        Err(e) => {
+                            eidos.metrics().persist_errors.inc();
+                            let resp = serde_json::json!({"ok": false, "error": e.to_string()});
+                            Ok(Response::new(Body::from(
+                                serde_json::to_string(&resp).unwrap_or_default(),
+                            )))
+                        }
+                    }
+                }
+                Err(e) => {
+                    let mut resp = Response::new(Body::from(e.to_string()));
+                    *resp.status_mut() = StatusCode::BAD_REQUEST;
+                    Ok(resp)
+                }
+            }
+        }
+        
+        (Method::POST, "/query") => {
+            let body = hyper::body::to_bytes(req.into_body()).await.unwrap_or_default();
+            match serde_json::from_slice::<QueryRequest>(&body) {
+                Ok(req) => {
+                    let k = req.k.unwrap_or(10);
+                    let include_residuals = req.include_residuals.unwrap_or(false);
+                    match eidos.recall_with_residuals(&req.feature, k, include_residuals).await {
+                        Ok(results) => {
+                            let resp = QueryResponse { results };
+                            Ok(Response::new(Body::from(
+                                serde_json::to_string(&resp).unwrap_or_default(),
+                            )))
+                        }
+                        Err(e) => {
+                            eidos.metrics().query_errors.inc();
+                            let resp = serde_json::json!({"ok": false, "error": e.to_string()});
+                            Ok(Response::new(Body::from(
+                                serde_json::to_string(&resp).unwrap_or_default(),
+                            )))
+                        }
+                    }
+                }
+                Err(e) => {
+                    let mut resp = Response::new(Body::from(e.to_string()));
+                    *resp.status_mut() = StatusCode::BAD_REQUEST;
+                    Ok(resp)
+                }
+            }
+        }
+        
+        (Method::POST, "/compact") => {
+            match eidos.force_compaction().await {
+                Ok(report) => {
+                    let resp = serde_json::json!({
+                        "ok": true,
+                        "inputs_merged": report.inputs_merged,
+                        "outputs_created": report.outputs_created,
+                        "space_saved": report.space_saved,
+                        "duration_ms": report.duration.as_millis(),
+                    });
+                    Ok(Response::new(Body::from(
+                        serde_json::to_string(&resp).unwrap_or_default(),
+                    )))
+                }
+                Err(e) => {
+                    let resp = serde_json::json!({"ok": false, "error": e.to_string()});
+                    Ok(Response::new(Body::from(
+                        serde_json::to_string(&resp).unwrap_or_default(),
+                    )))
+                }
+            }
+        }
+        
+        (Method::POST, p) if p.starts_with("/pin/") => {
+            let id_str = p.strip_prefix("/pin/").unwrap_or("");
+            let body = hyper::body::to_bytes(req.into_body()).await.unwrap_or_default();
+            let pin_req: PinRequest = serde_json::from_slice(&body).unwrap_or_default();
+            if let Ok(id) = Uuid::parse_str(id_str) {
+                let level = match pin_req.level.as_deref() {
+                    Some("user") => PinLevel::User,
+                    Some("task") => PinLevel::Task,
+                    Some("system") => PinLevel::System,
+                    _ => PinLevel::User,
+                };
+                match eidos.orchestrator.pin_crystal(&id, level, pin_req.ttl_seconds) {
+                    Ok(pinned) => {
+                        let resp = serde_json::json!({"ok": true, "pinned": pinned, "level": level.to_string()});
+                        Ok(Response::new(Body::from(
+                            serde_json::to_string(&resp).unwrap_or_default(),
+                        )))
+                    }
+                    Err(e) => {
+                        let resp = serde_json::json!({"ok": false, "error": e.to_string()});
+                        Ok(Response::new(Body::from(
+                            serde_json::to_string(&resp).unwrap_or_default(),
+                        )))
+                    }
+                }
+            } else {
+                let mut resp = Response::new(Body::from("invalid uuid"));
+                *resp.status_mut() = StatusCode::BAD_REQUEST;
+                Ok(resp)
+            }
+        }
+        
+        (Method::POST, p) if p.starts_with("/unpin/") => {
+            let id_str = p.strip_prefix("/unpin/").unwrap_or("");
+            if let Ok(id) = Uuid::parse_str(id_str) {
+                match eidos.orchestrator.unpin_crystal(&id) {
+                    Ok(unpinned) => {
+                        let resp = serde_json::json!({"ok": true, "unpinned": unpinned});
+                        Ok(Response::new(Body::from(
+                            serde_json::to_string(&resp).unwrap_or_default(),
+                        )))
+                    }
+                    Err(e) => {
+                        let resp = serde_json::json!({"ok": false, "error": e.to_string()});
+                        Ok(Response::new(Body::from(
+                            serde_json::to_string(&resp).unwrap_or_default(),
+                        )))
+                    }
+                }
+            } else {
+                let mut resp = Response::new(Body::from("invalid uuid"));
+                *resp.status_mut() = StatusCode::BAD_REQUEST;
+                Ok(resp)
+            }
+        }
+        
+        _ => {
+            let mut not_found = Response::default();
+            *not_found.status_mut() = StatusCode::NOT_FOUND;
+            Ok(not_found)
+        }
+    }
+}
+// ============================================================
+// EIDOS系统主入口
+// ============================================================
+pub struct Eidos {
+    pub orchestrator: Arc<CognitiveOrchestrator>,
+    pub config: EidosConfig,
+    pub metrics: Arc<EidosMetrics>,
+    pub authenticator: Option<Arc<Authenticator>>,
+    pub resource_controller: Arc<ResourceController>,
+    runtime: tokio::runtime::Runtime,
+}
+impl Eidos {
+    pub fn initialize(config: EidosConfig) -> EidosResult<Self> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(config.shard_count * 2)
+            .thread_name("eidos-worker")
+            .enable_all()
+            .build()?;
+        let metrics = Arc::new(EidosMetrics::new());
+        let vault = TemporalVault::open(&config.data_path, config.max_concurrent_ops)?;
+        let residual_store: Arc<dyn AdvancedResidualStore + Send + Sync> = Arc::new(
+            SledAdvancedResidualStore::open(vault.db(), (config.residual_compressor.clone(), 1))?
+        );
+        let recall_manager = Arc::new(RecallManager::new(
+            residual_store.clone(),
+            config.max_concurrent_ops,
+            metrics.clone(),
+        ));
+        let orchestrator = CognitiveOrchestrator::initialize(vault, residual_store, recall_manager, config.clone(), metrics.clone())?;
+        let resource_controller = Arc::new(ResourceController::new(
+            1024 * 1024 * 1024, // 1GB
+            Duration::from_secs(30),
+            orchestrator.vault_arc(),
+        ));
+        resource_controller.monitor_and_throttle();
+        info!("Eidos system initialized successfully");
+        Ok(Self {
+            orchestrator: Arc::new(orchestrator),
+            config,
+            metrics,
+            authenticator: None,
+            resource_controller,
+            runtime,
+        })
+    }
+    pub fn with_authenticator(mut self, auth: Authenticator) -> Self {
+        self.authenticator = Some(Arc::new(auth));
+        self
+    }
+    pub async fn ingest(&self, percept: ConsciousnessStream) -> EidosResult<IngestResult> {
+        let orchestrator = self.orchestrator.clone();
+        self.runtime.spawn_blocking(move || {
+            orchestrator.ingest(percept)
+        }).await?
+    }
+    pub async fn recall(
+        &self,
+        query_vector: &[f32],
+        top_k: usize,
+    ) -> EidosResult<Vec<RecallResult>> {
+        self.recall_with_residuals(query_vector, top_k, false).await
+    }
+    pub async fn recall_with_residuals(
+        &self,
+        query_vector: &[f32],
+        top_k: usize,
+        include_residuals: bool,
+    ) -> EidosResult<Vec<RecallResult>> {
+        let orchestrator = self.orchestrator.clone();
+        let query_vector = query_vector.to_vec();
+        self.runtime.spawn_blocking(move || {
+            orchestrator.recall(&query_vector, top_k, include_residuals)
+        }).await?
+    }
+    pub async fn force_compaction(&self) -> EidosResult<CompactionReport> {
+        let orchestrator = self.orchestrator.clone();
+        self.runtime.spawn_blocking(move || {
+            orchestrator.force_compaction()
+        }).await?
+    }
+    pub fn crystal_count(&self) -> usize {
+        self.orchestrator.crystal_count()
+    }
+    pub fn metrics(&self) -> &EidosMetrics {
+        &self.metrics
+    }
+    pub async fn run_daemon(self) -> EidosResult<()> {
+        info!("Eidos daemon starting");
+        let http_addr: SocketAddr = self.config.http_addr
+            .parse()
+            .map_err(|e: std::net::AddrParseError| EidosError::InvalidInput(e.to_string()))?;
+        let eidos_arc = Arc::new(self);
+        let ingest = Arc::new(IngestService::new(
+            eidos_arc.orchestrator.clone(),
+            eidos_arc.config.ingest_buffer,
+            eidos_arc.metrics.clone(),
+        ));
+        // 启动HTTP服务器
+        let http_eidos = eidos_arc.clone();
+        let http_ingest = ingest.clone();
+        let http_handle = tokio::spawn(async move {
+            let make_service = hyper::service::make_service_fn(move |_conn| {
+                let http_eidos = http_eidos.clone();
+                let http_ingest = http_ingest.clone();
+                async move {
+                    Ok::<_, Infallible>(hyper::service::service_fn(move |req| {
+                        handle_request(req, http_eidos.clone(), http_ingest.clone())
+                    }))
+                }
+            });
+            let server = Server::bind(&http_addr).serve(make_service);
+            info!("HTTP server listening on {}", http_addr);
+            if let Err(e) = server.await {
+                error!("HTTP server error: {:?}", e);
+            }
+        });
+        // 等待关闭信号
+        tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
+        info!("Received shutdown signal");
+        // 关闭服务器
+        http_handle.abort();
+        // 刷新并关闭
+        eidos_arc.orchestrator.vault().flush()?;
+        info!("Eidos daemon shutdown complete");
+        Ok(())
+    }
+    pub async fn shutdown(self) -> EidosResult<()> {
+        info!("Shutting down Eidos system");
+        self.orchestrator.vault().flush()?;
+        self.runtime.shutdown_timeout(Duration::from_secs(5));
+        info!("Eidos system shutdown complete");
+        Ok(())
+    }
+}
+// ============================================================
+// 预导入模块
+// ============================================================
+pub mod prelude {
+    pub use super::{
+        Eidos,
+        EidosConfig,
+        EidosError,
+        EidosResult,
+        EidosMetrics,
+        ConsciousnessStream,
+        MemoryCrystal,
+        CognitiveOrchestrator,
+        TemporalVault,
+        SpatialEngine,
+        SpatialNavigator,
+        LinearNavigator,
+        DimensionalShard,
+        TemporalEcho,
+        CompactionPlan,
+        OperationLog,
+        IngestResult,
+        RecallResult,
+        CompactionReport,
+        CosmicTimestamp,
+        CompactionStrategy,
+        NavigatorType,
+        LogarithmicDecay,
+        ExponentialDecay,
+        AdaptiveDecay,
+        PinLevel,
+        AdvancedResidualStore,
+        SledAdvancedResidualStore,
+        IngestService,
+        RecallManager,
+        RecallRequest,
+        Authenticator,
+        ConfigManager,
+        ResourceController,
+        SchemaMigrator,
+        CompactionExecutor,
+    };
+}
+// ============================================================
+// 主函数
+// ============================================================
+fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .init();
+    info!("══════════════════════════════════════════════════════════════════");
+    info!("EIDOS v2.0 — 工业级频率感知记忆压缩引擎（终极单文件修复版）");
+    info!("无拘无束的思想体 — 具身智能体的在线记忆压缩与管理系统");
+    info!("══════════════════════════════════════════════════════════════════");
+    
+    let config = EidosConfig::production();
+    match Eidos::initialize(config) {
+        Ok(eidos) => {
+            info!("Eidos initialized successfully");
+            info!("Crystal count: {}", eidos.crystal_count());
+            
+            // 在外部创建一个单独的 runtime，用来驱动最外层的 run_daemon 异步入口
+            // 避免了 "借用 eidos.runtime 的同时 move eidos" 的所有权冲突
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+                
+            if let Err(e) = rt.block_on(eidos.run_daemon()) {
+                error!("Daemon failed: {:?}", e);
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            error!("Failed to initialize Eidos: {:?}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+// ============================================================
+// 测试
+// ============================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    fn create_test_config() -> EidosConfig {
+        let dir = tempdir().unwrap();
+        EidosConfig {
+            data_path: dir.path().to_str().unwrap().to_string(),
+            max_concurrent_ops: 2,
+            residual_compressor: "identity".to_string(),
+            jwt_secret_b64: None,
+            metrics_bind: "127.0.0.1:0".to_string(),
+            auth_enabled: false,
+            decay_strategy: "logarithmic".to_string(),
+            compaction_threshold: 0.80,
+            residual_levels: 1,
+            shard_count: 4,
+            similarity_threshold: 0.80,
+            max_crystals: 100,
+            persist_enabled: true,
+            http_addr: "127.0.0.1:0".to_string(),
+            grpc_addr: None,
+            grpc_token: None,
+            ingest_buffer: 1024,
+            compaction_strategy: CompactionStrategy::OnDemand,
+            navigator_type: NavigatorType::Linear,
+            exponential_half_life_hours: 24.0,
+            adaptive_alpha: 0.2,
+            adaptive_min_half_life: 1.0,
+            adaptive_max_half_life: 48.0,
+            residual_projection_dim: None,
+        }
+    }
+    #[test]
+    fn test_spatial_engine_cosine_similarity() {
+        let a = vec![1.0f32, 0.0, 0.0];
+        let b = vec![1.0f32, 0.0, 0.0];
+        let sim = SpatialEngine::cosine_similarity(&a, &b);
+        assert!((sim - 1.0).abs() < 1e-6);
+        let c = vec![0.0f32, 1.0, 0.0];
+        let sim_orth = SpatialEngine::cosine_similarity(&a, &c);
+        assert!(sim_orth.abs() < 1e-6);
+    }
+    #[test]
+    fn test_cosmic_timestamp() {
+        let ts = CosmicTimestamp::now();
+        let elapsed = ts.elapsed_since(CosmicTimestamp::from_nanos(ts.as_i64() - 1_000_000_000));
+        assert_eq!(elapsed, Duration::from_secs(1));
+        let dt = ts.to_datetime();
+        let ts2 = CosmicTimestamp::from_datetime(dt);
+        assert_eq!(ts.as_i64(), ts2.as_i64());
+    }
+    #[test]
+    fn test_memory_crystal_creation() {
+        let percept = ConsciousnessStream::new(
+            vec![1.0f32, 2.0, 3.0],
+            serde_json::json!({"source": "test"}),
+        );
+        let crystal = MemoryCrystal::from_consciousness(&percept);
+        assert_eq!(crystal.count, 1);
+        assert_eq!(crystal.centroid.len(), 3);
+        assert_eq!(crystal.pin_level, PinLevel::None);
+        assert!(!crystal.has_residual);
+        assert!(crystal.quality_score > 0.0);
+    }
+    #[test]
+    fn test_pin_levels() {
+        let mut crystal = MemoryCrystal::from_consciousness(&ConsciousnessStream::new(
+            vec![1.0f32; 16],
+            serde_json::json!({}),
+        ));
+        assert!(!crystal.is_pinned(CosmicTimestamp::now()));
+        crystal.pin_permanent(PinLevel::User);
+        assert!(crystal.is_pinned(CosmicTimestamp::now()));
+        assert_eq!(crystal.pin_level, PinLevel::User);
+        crystal.unpin();
+        assert!(!crystal.is_pinned(CosmicTimestamp::now()));
+    }
+    #[test]
+    fn test_temporal_vault_crud() {
+        let dir = tempdir().unwrap();
+        let vault = TemporalVault::open(dir.path(), 2).unwrap();
+        let crystal = MemoryCrystal::from_consciousness(&ConsciousnessStream::new(
+            vec![1.0f32; 16],
+            serde_json::json!({"test": true}),
+        ));
+        vault.store_crystal(&crystal).unwrap();
+        let retrieved = vault.retrieve_crystal(&crystal.id).unwrap();
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().id, crystal.id);
+        vault.delete_crystal(&crystal.id).unwrap();
+        let deleted = vault.retrieve_crystal(&crystal.id).unwrap();
+        assert!(deleted.is_none());
+    }
+    #[test]
+    fn test_residual_store() {
+        let dir = tempdir().unwrap();
+        let db = sled::open(dir.path()).unwrap();
+        let store = SledAdvancedResidualStore::open(&db, ("identity".to_string(), 1)).unwrap();
+        let id = Uuid::new_v4();
+        let data = vec![0.1f32, 0.2, 0.3];
+        let compressor = IdentityCompressor;
+        let compressed = compressor.compress(&data).unwrap();
+        store.store_chunk(&id, 0, &compressed, compressor.name(), compressor.version()).unwrap();
+        let metas = store.get_chunk_meta(&id).unwrap();
+        assert_eq!(metas.len(), 1);
+        let got = store.get_chunk(&id, 0).unwrap().unwrap();
+        let decompressed = compressor.decompress(&got).unwrap();
+        assert_eq!(decompressed, data);
+        store.remove_chunks(&id).unwrap();
+        assert!(store.get_chunk_meta(&id).unwrap().is_empty());
+    }
+    #[test]
+    fn test_eidos_initialization() {
+        let config = create_test_config();
+        let eidos = Eidos::initialize(config).unwrap();
+        assert_eq!(eidos.crystal_count(), 0);
+        eidos.runtime.block_on(eidos.shutdown()).unwrap();
+    }
+    #[test]
+    fn test_eidos_ingest_and_recall() {
+        let config = create_test_config();
+        let eidos = Eidos::initialize(config).unwrap();
+        eidos.runtime.block_on(async {
+            for i in 0..10 {
+                let percept = ConsciousnessStream::new(
+                    vec![i as f32; 32],
+                    serde_json::json!({"i": i}),
+                );
+                eidos.ingest(percept).await.unwrap();
+            }
+            assert_eq!(eidos.crystal_count(), 10);
+            let results = eidos.recall(&vec![5.0f32; 32], 3).await.unwrap();
+            assert_eq!(results.len(), 3);
+        }).unwrap();
+        eidos.runtime.block_on(eidos.shutdown()).unwrap();
+    }
+    #[test]
+    fn test_decay_strategies() {
+        let log_decay = LogarithmicDecay;
+        let exp_decay = ExponentialDecay { half_life_hours: 1.0 };
+        let adaptive_decay = AdaptiveDecay::new(0.2, 1.0, 48.0);
+        let now = CosmicTimestamp::now();
+        let past = CosmicTimestamp::from_nanos(now.as_i64() - 3_600_000_000_000); // 1小时前
+        let log_weight = log_decay.calculate_weight(10, past, now);
+        let exp_weight = exp_decay.calculate_weight(10, past, now);
+        let adaptive_weight = adaptive_decay.calculate_weight(10, past, now);
+        assert!(log_weight > 0.0);
+        assert!(exp_weight > 0.0);
+        assert!(adaptive_weight > 0.0);
+        assert!((exp_weight - 5.0).abs() < 0.1); // 1个半衰期后应该是5
+    }
+}
