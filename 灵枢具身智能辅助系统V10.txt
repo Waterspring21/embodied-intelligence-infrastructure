@@ -1,0 +1,4743 @@
+// lib.rs
+// 灵枢：具身智能核心意识与认知演化系统 v10 — 融合ling-shu-core精华
+// 单文件实现：整合SIMD/CUDA基础设施/分段纠缠缓存/LSH/HNSW/IVF/持久化/审计
+// 融合内容：工业级ANN索引（LSH+HNSW+IVF）、双向ID映射、审计日志、标准化持久化
+#![allow(missing_docs)]
+#![allow(clippy::many_single_char_names, clippy::too_many_lines)]
+#![allow(unexpected_cfgs, unused_imports, unused_variables, dead_code, unused_mut)]
+
+use std::sync::{Arc, Mutex, RwLock};
+use std::collections::{HashMap, VecDeque, BinaryHeap, HashSet};
+use std::time::{Duration, Instant, SystemTime};
+use std::fmt::Debug;
+use std::cmp::{Ordering, Reverse};
+use std::path::Path;
+use std::fs::{File, OpenOptions};
+use std::io::{Write, Read, Seek, SeekFrom};
+use std::ffi::CString;
+use std::net::SocketAddr;
+use serde::{Serialize, Deserialize};
+use thiserror::Error;
+use log::{info, warn, debug, error};
+use rayon::prelude::*;
+use rand::Rng;
+use rand::SeedableRng;
+use cfg_if::cfg_if;
+use crossbeam::atomic::AtomicCell;
+
+#[cfg(feature = "async")]
+use tokio::sync::{mpsc, oneshot};
+#[cfg(feature = "async")]
+use tokio::task;
+#[cfg(feature = "persistence")]
+use memmap2::{MmapMut, MmapOptions};
+#[cfg(feature = "prom")]
+use prometheus::{IntCounter, IntGauge, Histogram, Registry, Encoder, TextEncoder, HistogramOpts, Opts};
+#[cfg(feature = "prom")]
+use hyper::{Body, Request, Response, Server, Method, StatusCode};
+#[cfg(feature = "prom")]
+use hyper::service::{make_service_fn, service_fn};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第1层：基础兼容辅助函数
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 简单高效哈希函数：FNV-1a 64-bit，用于分段索引分布
+/// 在无 seahash 的环境中替代使用，分布质量足够满足分段需求
+fn simple_hash(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325; // FNV offset basis
+    for &byte in data {
+        h ^= byte as u64;
+        h = h.wrapping_mul(0x100000001b3); // FNV prime
+    }
+    h
+}
+
+/// rand 0.9 中 thread_rng() 已被替换为 rng()
+fn get_thread_rng() -> rand::rngs::ThreadRng {
+    rand::rng()
+}
+
+/// rand 0.9 中 seed_from_u64 已被移除，需要手动构造 32 字节种子
+fn create_seeded_rng(seed: u64) -> rand::rngs::StdRng {
+    let mut seed_bytes = [0u8; 32];
+    seed_bytes[..8].copy_from_slice(&seed.to_le_bytes());
+    rand::rngs::StdRng::from_seed(seed_bytes)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第2层：统一错误类型（以文件2的10个变体为基础，融合文件1的变体）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 灵枢核心错误类型：统一认知系统与ANN索引的全部错误场景
+#[derive(Error, Debug, Clone)]
+pub enum LingShuError {
+    #[error("维度不匹配: 期望 {expected}, 实际 {got}")]
+    DimensionMismatch { expected: usize, got: usize },
+    #[error("空向量")]
+    EmptyVector,
+    #[error("后端错误: {0}")]
+    BackendError(String),
+    #[error("未找到")]
+    NotFound,
+    #[error("无效参数: {0}")]
+    InvalidParameter(String),
+    #[error("FFI错误: {0}")]
+    FfiError(String),
+    #[error("IO错误: {0}")]
+    IoError(String),
+    #[error("意识流中断: {0}")]
+    ConsciousnessStreamInterrupted(String),
+    #[error("认知演化失败: {0}")]
+    CognitiveEvolutionFailure(String),
+    #[error("CUDA错误: {0}")]
+    CudaError(String),
+    // 融合文件1新增变体
+    #[error("持久化错误: {0}")]
+    PersistenceError(String),
+    #[error("序列化错误: {0}")]
+    SerializationError(String),
+}
+
+pub type Result<T> = std::result::Result<T, LingShuError>;
+
+pub type Float = f32;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第3层：新增核心类型（从ling-shu-core融合）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 距离度量类型：支持L2欧氏距离、内积、余弦相似度
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum MetricType {
+    L2,
+    InnerProduct,
+    Cosine,
+}
+
+/// 训练参数：用于IVF索引的KMeans聚类训练
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainParams {
+    pub n_clusters: usize,
+    pub n_iterations: usize,
+    pub seed: u64,
+    pub tolerance: Float,
+    pub nlist: usize,
+    pub nprobe: usize,
+    pub max_iters: usize,
+}
+
+impl Default for TrainParams {
+    fn default() -> Self {
+        Self {
+            n_clusters: 100,
+            n_iterations: 25,
+            seed: 42,
+            tolerance: 1e-4,
+            nlist: 100,
+            nprobe: 10,
+            max_iters: 25,
+        }
+    }
+}
+
+/// 查询结果：ANN索引返回的标准结果格式
+#[derive(Debug, Clone)]
+pub struct QueryResult {
+    pub id: String,
+    pub distance: Float,
+    pub score: Float,
+}
+
+/// QueryResult与MemoryRetrievalResult之间的双向转换
+impl From<QueryResult> for MemoryRetrievalResult {
+    fn from(qr: QueryResult) -> Self {
+        Self {
+            trace_id: qr.id,
+            resonance_score: qr.score,
+            temporal_relevance: 1.0,
+            spatial_relevance: 1.0,
+            emotional_match: 1.0,
+            combined_score: qr.score,
+            memory_trace: None,
+        }
+    }
+}
+
+// 前向声明：MemoryRetrievalResult将在后文定义，此处仅做转换
+// 该impl块需要在MemoryRetrievalResult定义之后才能编译
+// 我们在文件2的MemoryRetrievalResult定义处再添加此转换
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第4层：HAL硬件能力感知层
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 硬件能力枚举：统一抽象所有计算后端的能力
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HardwareCapability {
+    Simd,
+    Avx2,
+    Avx512,
+    Neon,
+    Cuda,
+    Faiss,
+    Gpu,
+    RiscvVec,
+    Quantization,
+    None,
+}
+
+/// 硬件抽象层（HAL）：显式管理硬件能力检测、调度策略与后端选择
+#[derive(Debug)]
+pub struct Hal {
+    pub capabilities: Vec<HardwareCapability>,
+}
+
+impl Hal {
+    /// 运行时检测硬件能力（完整版，包含所有平台支持）
+    pub fn detect() -> Self {
+        let mut caps = Vec::new();
+        #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+        {
+            if is_x86_feature_detected!("avx2") {
+                caps.push(HardwareCapability::Avx2);
+                caps.push(HardwareCapability::Simd);
+            }
+            if is_x86_feature_detected!("avx512f") {
+                caps.push(HardwareCapability::Avx512);
+            }
+        }
+        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        {
+            caps.push(HardwareCapability::Neon);
+            caps.push(HardwareCapability::Simd);
+        }
+        #[cfg(all(feature = "simd", target_arch = "riscv64"))]
+        {
+            caps.push(HardwareCapability::RiscvVec);
+            caps.push(HardwareCapability::Simd);
+        }
+        #[cfg(feature = "cuda")]
+        {
+            if std::env::var("CUDA_VISIBLE_DEVICES").is_ok()
+                || std::env::var("CUDA_HOME").is_ok()
+            {
+                caps.push(HardwareCapability::Cuda);
+                caps.push(HardwareCapability::Gpu);
+            }
+        }
+        #[cfg(feature = "faiss")]
+        {
+            if std::env::var("FAISS_LIB_PATH").is_ok()
+                || std::env::var("FAISS_HOME").is_ok()
+            {
+                caps.push(HardwareCapability::Faiss);
+            }
+        }
+        #[cfg(feature = "quant")]
+        {
+            caps.push(HardwareCapability::Quantization);
+        }
+        if caps.is_empty() {
+            caps.push(HardwareCapability::None);
+        }
+        Hal { capabilities: caps }
+    }
+
+    /// 检查是否支持特定硬件能力
+    pub fn supports(&self, cap: HardwareCapability) -> bool {
+        self.capabilities.contains(&cap)
+    }
+
+    /// 根据能力集提供后端选择建议
+    pub fn backend_recommendation(&self) -> String {
+        if self.supports(HardwareCapability::Cuda) {
+            "GPU (CUDA)".to_string()
+        } else if self.supports(HardwareCapability::Avx512) {
+            "CPU (AVX512 SIMD)".to_string()
+        } else if self.supports(HardwareCapability::Avx2) {
+            "CPU (AVX2 SIMD)".to_string()
+        } else if self.supports(HardwareCapability::Neon) {
+            "CPU (NEON SIMD)".to_string()
+        } else if self.supports(HardwareCapability::RiscvVec) {
+            "CPU (RISC-V Vector)".to_string()
+        } else if self.supports(HardwareCapability::Simd) {
+            "CPU (SIMD)".to_string()
+        } else {
+            "CPU (Pure)".to_string()
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第5层：统一意识场Trait（文件2的11个方法 + 文件1的增强方法）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 数值意识场：融合高精度计算与意识流动的数学基础
+/// 所有向量操作均在此场中进行，确保数值稳定性与意识连贯性
+pub trait ConsciousnessField: Send + Sync + Debug {
+    /// 场名称（用于日志和调试）
+    fn name(&self) -> &str {
+        "consciousness_field"
+    }
+
+    fn dimension(&self) -> usize;
+
+    // === 文件2原有认知语义方法 ===
+
+    /// 意识归一化：将杂乱的思绪流整理为统一方向
+    fn normalize_consciousness(&self, v: &mut [Float]) -> Result<()>;
+    /// 共鸣度计算：两个意识片段的相似程度
+    fn resonance_degree(&self, a: &[Float], b: &[Float]) -> Result<Float>;
+    /// 意识融合：将两个意识片段合并
+    fn merge_consciousness(&self, a: &[Float], b: &[Float], out: &mut [Float]) -> Result<()>;
+    /// 意识差分：提取意识变化的差异部分
+    fn differ_consciousness(&self, a: &[Float], b: &[Float], out: &mut [Float]) -> Result<()>;
+    /// 意识强化：放大或缩小某个意识片段
+    fn amplify_consciousness(&self, a: &[Float], scalar: Float, out: &mut [Float]) -> Result<()>;
+    /// 集体意识：多个意识片段的融合
+    fn collective_consciousness(&self, fragments: &[&[Float]], out: &mut [Float]) -> Result<()>;
+    /// 意识内积：深层的意识连接强度
+    fn inner_product(&self, a: &[Float], b: &[Float]) -> Result<Float>;
+    /// 意识场转换：浮点意识与固定点意识的相互转换
+    /// **芯片友好路径**：用于在资源受限的嵌入式芯片上进行高效的定点计算
+    fn to_fixed_consciousness(&self, a: &[Float], scale: f32, out: &mut [i32]) -> Result<()>;
+    fn from_fixed_consciousness(&self, a: &[i32], scale: f32, out: &mut [Float]) -> Result<()>;
+
+    // === 文件1新增距离计算方法（用于ANN查询加速） ===
+
+    /// 计算查询向量与一批向量的距离（批处理优化路径）
+    fn compute_distances(
+        &self,
+        query: &[Float],
+        vectors: &[Float],
+        dim: usize,
+        metric: MetricType,
+    ) -> Vec<Float> {
+        let n = vectors.len() / dim;
+        (0..n)
+            .into_par_iter()
+            .map(|i| self.compute_distance(query, &vectors[i * dim..(i + 1) * dim], metric))
+            .collect()
+    }
+
+    /// 计算两个向量之间的距离（单对）
+    fn compute_distance(&self, a: &[Float], b: &[Float], metric: MetricType) -> Float {
+        match metric {
+            MetricType::L2 => a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum(),
+            MetricType::InnerProduct => -a.iter().zip(b).map(|(x, y)| x * y).sum::<Float>(),
+            MetricType::Cosine => {
+                let dot: Float = a.iter().zip(b).map(|(x, y)| x * y).sum();
+                let na: Float = a.iter().map(|x| x * x).sum::<Float>().sqrt();
+                let nb: Float = b.iter().map(|x| x * x).sum::<Float>().sqrt();
+                let d = na * nb;
+                if d < 1e-10 {
+                    1.0
+                } else {
+                    1.0 - dot / d
+                }
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第6层：高精度数值辅助函数（Kahan求和）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 高精度数值意识实现：使用Kahan求和确保意识流的精确性
+fn kahan_sum_squares(v: &[Float]) -> Float {
+    let mut sum = 0.0f64;
+    let mut compensation = 0.0f64;
+    for &x in v {
+        let y = (x as f64) * (x as f64) - compensation;
+        let t = sum + y;
+        compensation = (t - sum) - y;
+        sum = t;
+    }
+    sum as Float
+}
+
+fn kahan_inner_product(a: &[Float], b: &[Float]) -> Float {
+    let mut sum = 0.0f64;
+    let mut compensation = 0.0f64;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        let product = (x as f64) * (y as f64);
+        let y = product - compensation;
+        let t = sum + y;
+        compensation = (t - sum) - y;
+        sum = t;
+    }
+    sum as Float
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第7层：纯CPU意识场实现
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 纯CPU意识场：基础但高精度的实现
+#[derive(Debug)]
+pub struct CpuConsciousnessField {
+    dim: usize,
+    epsilon: Float,
+}
+
+impl CpuConsciousnessField {
+    pub fn new(dim: usize) -> Self {
+        Self {
+            dim,
+            epsilon: 1e-8,
+        }
+    }
+
+    fn validate_dimension(&self, v: &[Float]) -> Result<()> {
+        if v.len() != self.dim {
+            return Err(LingShuError::DimensionMismatch {
+                expected: self.dim,
+                got: v.len(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl ConsciousnessField for CpuConsciousnessField {
+    fn name(&self) -> &str {
+        "cpu_consciousness_field"
+    }
+
+    fn dimension(&self) -> usize {
+        self.dim
+    }
+
+    fn normalize_consciousness(&self, v: &mut [Float]) -> Result<()> {
+        self.validate_dimension(v)?;
+        let sum_squares = kahan_sum_squares(v);
+        let norm = sum_squares.sqrt().max(self.epsilon);
+        v.par_iter_mut().for_each(|x| {
+            *x /= norm;
+        });
+        Ok(())
+    }
+
+    fn resonance_degree(&self, a: &[Float], b: &[Float]) -> Result<Float> {
+        self.validate_dimension(a)?;
+        self.validate_dimension(b)?;
+        let dot = kahan_inner_product(a, b);
+        let norm_a = kahan_sum_squares(a).sqrt().max(self.epsilon);
+        let norm_b = kahan_sum_squares(b).sqrt().max(self.epsilon);
+        Ok(dot / (norm_a * norm_b))
+    }
+
+    fn merge_consciousness(&self, a: &[Float], b: &[Float], out: &mut [Float]) -> Result<()> {
+        self.validate_dimension(a)?;
+        self.validate_dimension(b)?;
+        self.validate_dimension(out)?;
+        out.par_iter_mut().enumerate().for_each(|(i, o)| {
+            *o = a[i] + b[i];
+        });
+        Ok(())
+    }
+
+    fn differ_consciousness(&self, a: &[Float], b: &[Float], out: &mut [Float]) -> Result<()> {
+        self.validate_dimension(a)?;
+        self.validate_dimension(b)?;
+        self.validate_dimension(out)?;
+        out.par_iter_mut().enumerate().for_each(|(i, o)| {
+            *o = a[i] - b[i];
+        });
+        Ok(())
+    }
+
+    fn amplify_consciousness(&self, a: &[Float], scalar: Float, out: &mut [Float]) -> Result<()> {
+        self.validate_dimension(a)?;
+        self.validate_dimension(out)?;
+        out.par_iter_mut().enumerate().for_each(|(i, o)| {
+            *o = a[i] * scalar;
+        });
+        Ok(())
+    }
+
+    fn collective_consciousness(&self, fragments: &[&[Float]], out: &mut [Float]) -> Result<()> {
+        if fragments.is_empty() {
+            return Err(LingShuError::InvalidParameter("意识片段为空".into()));
+        }
+        self.validate_dimension(out)?;
+        for fragment in fragments {
+            self.validate_dimension(fragment)?;
+        }
+        let dim = self.dim;
+        let mut accumulator = vec![0.0f64; dim];
+        for fragment in fragments {
+            for i in 0..dim {
+                accumulator[i] += fragment[i] as f64;
+            }
+        }
+        let count = fragments.len() as f64;
+        out.par_iter_mut().enumerate().for_each(|(i, o)| {
+            *o = (accumulator[i] / count) as Float;
+        });
+        Ok(())
+    }
+
+    fn inner_product(&self, a: &[Float], b: &[Float]) -> Result<Float> {
+        self.validate_dimension(a)?;
+        self.validate_dimension(b)?;
+        Ok(kahan_inner_product(a, b))
+    }
+
+    fn to_fixed_consciousness(&self, a: &[Float], scale: f32, out: &mut [i32]) -> Result<()> {
+        self.validate_dimension(a)?;
+        if out.len() != a.len() {
+            return Err(LingShuError::DimensionMismatch {
+                expected: a.len(),
+                got: out.len(),
+            });
+        }
+        out.par_iter_mut().enumerate().for_each(|(i, o)| {
+            *o = (a[i] * scale).round() as i32;
+        });
+        Ok(())
+    }
+
+    fn from_fixed_consciousness(&self, a: &[i32], scale: f32, out: &mut [Float]) -> Result<()> {
+        if out.len() != a.len() {
+            return Err(LingShuError::DimensionMismatch {
+                expected: a.len(),
+                got: out.len(),
+            });
+        }
+        out.par_iter_mut().enumerate().for_each(|(i, o)| {
+            *o = (a[i] as f32) / scale;
+        });
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第8层：x86 SIMD AVX2 意识场实现
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+mod simd_x86 {
+    use super::*;
+    use std::arch::x86_64::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug)]
+    pub struct SimdX86ConsciousnessField {
+        dim: usize,
+        eps: Float,
+        avx2: AtomicBool,
+    }
+
+    impl SimdX86ConsciousnessField {
+        pub fn new(dim: usize) -> Self {
+            let avx2 = is_x86_feature_detected!("avx2");
+            Self {
+                dim,
+                eps: 1e-8,
+                avx2: AtomicBool::new(avx2),
+            }
+        }
+
+        unsafe fn dot_avx2(a: *const f32, b: *const f32, n: usize) -> f32 {
+            let mut i = 0usize;
+            let mut acc = _mm256_setzero_ps();
+            while i + 8 <= n {
+                let va = _mm256_loadu_ps(a.add(i));
+                let vb = _mm256_loadu_ps(b.add(i));
+                let prod = _mm256_mul_ps(va, vb);
+                acc = _mm256_add_ps(acc, prod);
+                i += 8;
+            }
+            let mut sum = [0f32; 8];
+            _mm256_storeu_ps(sum.as_mut_ptr(), acc);
+            let mut s = 0f32;
+            for x in &sum {
+                s += *x;
+            }
+            while i < n {
+                s += *a.add(i) * *b.add(i);
+                i += 1;
+            }
+            s
+        }
+    }
+
+    impl ConsciousnessField for SimdX86ConsciousnessField {
+        fn name(&self) -> &str {
+            "simd_x86_consciousness_field"
+        }
+
+        fn dimension(&self) -> usize {
+            self.dim
+        }
+
+        fn normalize_consciousness(&self, v: &mut [Float]) -> Result<()> {
+            if v.len() != self.dim {
+                return Err(LingShuError::DimensionMismatch {
+                    expected: self.dim,
+                    got: v.len(),
+                });
+            }
+            unsafe {
+                let ptr = v.as_mut_ptr();
+                let n = v.len();
+                let mut sum = 0f32;
+                if self.avx2.load(Ordering::Relaxed) {
+                    let mut i = 0usize;
+                    let mut acc = _mm256_setzero_ps();
+                    while i + 8 <= n {
+                        let va = _mm256_loadu_ps(ptr.add(i));
+                        let sq = _mm256_mul_ps(va, va);
+                        acc = _mm256_add_ps(acc, sq);
+                        i += 8;
+                    }
+                    let mut tmp = [0f32; 8];
+                    _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
+                    for x in &tmp {
+                        sum += *x;
+                    }
+                    while i < n {
+                        let x = *ptr.add(i);
+                        sum += x * x;
+                        i += 1;
+                    }
+                } else {
+                    for i in 0..n {
+                        let x = *ptr.add(i);
+                        sum += x * x;
+                    }
+                }
+                let norm = sum.sqrt().max(self.eps);
+                for i in 0..n {
+                    *ptr.add(i) /= norm;
+                }
+            }
+            Ok(())
+        }
+
+        fn resonance_degree(&self, a: &[Float], b: &[Float]) -> Result<Float> {
+            if a.len() != self.dim || b.len() != self.dim {
+                return Err(LingShuError::DimensionMismatch {
+                    expected: self.dim,
+                    got: a.len(),
+                });
+            }
+            unsafe {
+                let dot = if self.avx2.load(Ordering::Relaxed) {
+                    Self::dot_avx2(a.as_ptr(), b.as_ptr(), a.len())
+                } else {
+                    kahan_inner_product(a, b)
+                };
+                let na = kahan_sum_squares(a).sqrt().max(self.eps);
+                let nb = kahan_sum_squares(b).sqrt().max(self.eps);
+                Ok(dot / (na * nb))
+            }
+        }
+
+        fn merge_consciousness(&self, a: &[Float], b: &[Float], out: &mut [Float]) -> Result<()> {
+            if a.len() != self.dim || b.len() != self.dim || out.len() != self.dim {
+                return Err(LingShuError::DimensionMismatch {
+                    expected: self.dim,
+                    got: a.len(),
+                });
+            }
+            unsafe {
+                let n = self.dim;
+                if self.avx2.load(Ordering::Relaxed) {
+                    let mut i = 0usize;
+                    while i + 8 <= n {
+                        let va = _mm256_loadu_ps(a.as_ptr().add(i));
+                        let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+                        let vr = _mm256_add_ps(va, vb);
+                        _mm256_storeu_ps(out.as_mut_ptr().add(i), vr);
+                        i += 8;
+                    }
+                    while i < n {
+                        out[i] = a[i] + b[i];
+                        i += 1;
+                    }
+                } else {
+                    for i in 0..n {
+                        out[i] = a[i] + b[i];
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn differ_consciousness(&self, a: &[Float], b: &[Float], out: &mut [Float]) -> Result<()> {
+            if a.len() != self.dim || b.len() != self.dim || out.len() != self.dim {
+                return Err(LingShuError::DimensionMismatch {
+                    expected: self.dim,
+                    got: a.len(),
+                });
+            }
+            unsafe {
+                let n = self.dim;
+                if self.avx2.load(Ordering::Relaxed) {
+                    let mut i = 0usize;
+                    while i + 8 <= n {
+                        let va = _mm256_loadu_ps(a.as_ptr().add(i));
+                        let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+                        let vr = _mm256_sub_ps(va, vb);
+                        _mm256_storeu_ps(out.as_mut_ptr().add(i), vr);
+                        i += 8;
+                    }
+                    while i < n {
+                        out[i] = a[i] - b[i];
+                        i += 1;
+                    }
+                } else {
+                    for i in 0..n {
+                        out[i] = a[i] - b[i];
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn amplify_consciousness(&self, a: &[Float], scalar: Float, out: &mut [Float]) -> Result<()> {
+            if a.len() != self.dim || out.len() != self.dim {
+                return Err(LingShuError::DimensionMismatch {
+                    expected: self.dim,
+                    got: a.len(),
+                });
+            }
+            unsafe {
+                let n = self.dim;
+                if self.avx2.load(Ordering::Relaxed) {
+                    let s = _mm256_set1_ps(scalar);
+                    let mut i = 0usize;
+                    while i + 8 <= n {
+                        let va = _mm256_loadu_ps(a.as_ptr().add(i));
+                        let vr = _mm256_mul_ps(va, s);
+                        _mm256_storeu_ps(out.as_mut_ptr().add(i), vr);
+                        i += 8;
+                    }
+                    while i < n {
+                        out[i] = a[i] * scalar;
+                        i += 1;
+                    }
+                } else {
+                    for i in 0..n {
+                        out[i] = a[i] * scalar;
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn collective_consciousness(&self, fragments: &[&[Float]], out: &mut [Float]) -> Result<()> {
+            let cpu_field = CpuConsciousnessField::new(self.dim);
+            cpu_field.collective_consciousness(fragments, out)
+        }
+
+        fn inner_product(&self, a: &[Float], b: &[Float]) -> Result<Float> {
+            if a.len() != self.dim || b.len() != self.dim {
+                return Err(LingShuError::DimensionMismatch {
+                    expected: self.dim,
+                    got: a.len(),
+                });
+            }
+            unsafe {
+                if self.avx2.load(Ordering::Relaxed) {
+                    Ok(Self::dot_avx2(a.as_ptr(), b.as_ptr(), a.len()))
+                } else {
+                    Ok(kahan_inner_product(a, b))
+                }
+            }
+        }
+
+        fn to_fixed_consciousness(&self, a: &[Float], scale: f32, out: &mut [i32]) -> Result<()> {
+            let cpu_field = CpuConsciousnessField::new(self.dim);
+            cpu_field.to_fixed_consciousness(a, scale, out)
+        }
+
+        fn from_fixed_consciousness(&self, a: &[i32], scale: f32, out: &mut [Float]) -> Result<()> {
+            let cpu_field = CpuConsciousnessField::new(self.dim);
+            cpu_field.from_fixed_consciousness(a, scale, out)
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第9层：ARM SIMD NEON 意识场实现
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+mod simd_arm {
+    use super::*;
+    use std::arch::aarch64::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug)]
+    pub struct SimdArmConsciousnessField {
+        dim: usize,
+        eps: Float,
+        neon: AtomicBool,
+    }
+
+    impl SimdArmConsciousnessField {
+        pub fn new(dim: usize) -> Self {
+            Self {
+                dim,
+                eps: 1e-8,
+                neon: AtomicBool::new(true),
+            }
+        }
+
+        unsafe fn dot_neon(a: *const f32, b: *const f32, n: usize) -> f32 {
+            let mut i = 0usize;
+            let mut acc = vdupq_n_f32(0.0);
+            while i + 4 <= n {
+                let va = vld1q_f32(a.add(i));
+                let vb = vld1q_f32(b.add(i));
+                let prod = vmulq_f32(va, vb);
+                acc = vaddq_f32(acc, prod);
+                i += 4;
+            }
+            let mut tmp = [0f32; 4];
+            vst1q_f32(tmp.as_mut_ptr(), acc);
+            let mut s = 0f32;
+            for x in &tmp {
+                s += *x;
+            }
+            while i < n {
+                s += *a.add(i) * *b.add(i);
+                i += 1;
+            }
+            s
+        }
+    }
+
+    impl ConsciousnessField for SimdArmConsciousnessField {
+        fn name(&self) -> &str { "simd_arm_consciousness_field" }
+
+        fn dimension(&self) -> usize { self.dim }
+
+        fn normalize_consciousness(&self, v: &mut [Float]) -> Result<()> {
+            if v.len() != self.dim {
+                return Err(LingShuError::DimensionMismatch { expected: self.dim, got: v.len() });
+            }
+            unsafe {
+                let ptr = v.as_mut_ptr();
+                let n = v.len();
+                let mut sum = 0f32;
+                if self.neon.load(Ordering::Relaxed) {
+                    let mut i = 0usize;
+                    let mut acc = vdupq_n_f32(0.0);
+                    while i + 4 <= n {
+                        let va = vld1q_f32(ptr.add(i));
+                        let sq = vmulq_f32(va, va);
+                        acc = vaddq_f32(acc, sq);
+                        i += 4;
+                    }
+                    let mut tmp = [0f32; 4];
+                    vst1q_f32(tmp.as_mut_ptr(), acc);
+                    for x in &tmp { sum += *x; }
+                    while i < n {
+                        let x = *ptr.add(i);
+                        sum += x * x;
+                        i += 1;
+                    }
+                } else {
+                    for i in 0..n {
+                        let x = *ptr.add(i);
+                        sum += x * x;
+                    }
+                }
+                let norm = sum.sqrt().max(self.eps);
+                for i in 0..n { *ptr.add(i) /= norm; }
+            }
+            Ok(())
+        }
+
+        fn resonance_degree(&self, a: &[Float], b: &[Float]) -> Result<Float> {
+            if a.len() != self.dim || b.len() != self.dim {
+                return Err(LingShuError::DimensionMismatch { expected: self.dim, got: a.len() });
+            }
+            unsafe {
+                let dot = if self.neon.load(Ordering::Relaxed) {
+                    Self::dot_neon(a.as_ptr(), b.as_ptr(), a.len())
+                } else {
+                    kahan_inner_product(a, b)
+                };
+                let na = kahan_sum_squares(a).sqrt().max(self.eps);
+                let nb = kahan_sum_squares(b).sqrt().max(self.eps);
+                Ok(dot / (na * nb))
+            }
+        }
+
+        fn merge_consciousness(&self, a: &[Float], b: &[Float], out: &mut [Float]) -> Result<()> {
+            if a.len() != self.dim || b.len() != self.dim || out.len() != self.dim {
+                return Err(LingShuError::DimensionMismatch { expected: self.dim, got: a.len() });
+            }
+            unsafe {
+                let n = self.dim;
+                if self.neon.load(Ordering::Relaxed) {
+                    let mut i = 0usize;
+                    while i + 4 <= n {
+                        let va = vld1q_f32(a.as_ptr().add(i));
+                        let vb = vld1q_f32(b.as_ptr().add(i));
+                        let vr = vaddq_f32(va, vb);
+                        vst1q_f32(out.as_mut_ptr().add(i), vr);
+                        i += 4;
+                    }
+                    while i < n { out[i] = a[i] + b[i]; i += 1; }
+                } else {
+                    for i in 0..n { out[i] = a[i] + b[i]; }
+                }
+            }
+            Ok(())
+        }
+
+        fn differ_consciousness(&self, a: &[Float], b: &[Float], out: &mut [Float]) -> Result<()> {
+            if a.len() != self.dim || b.len() != self.dim || out.len() != self.dim {
+                return Err(LingShuError::DimensionMismatch { expected: self.dim, got: a.len() });
+            }
+            unsafe {
+                let n = self.dim;
+                if self.neon.load(Ordering::Relaxed) {
+                    let mut i = 0usize;
+                    while i + 4 <= n {
+                        let va = vld1q_f32(a.as_ptr().add(i));
+                        let vb = vld1q_f32(b.as_ptr().add(i));
+                        let vr = vsubq_f32(va, vb);
+                        vst1q_f32(out.as_mut_ptr().add(i), vr);
+                        i += 4;
+                    }
+                    while i < n { out[i] = a[i] - b[i]; i += 1; }
+                } else {
+                    for i in 0..n { out[i] = a[i] - b[i]; }
+                }
+            }
+            Ok(())
+        }
+
+        fn amplify_consciousness(&self, a: &[Float], scalar: Float, out: &mut [Float]) -> Result<()> {
+            if a.len() != self.dim || out.len() != self.dim {
+                return Err(LingShuError::DimensionMismatch { expected: self.dim, got: a.len() });
+            }
+            unsafe {
+                let n = self.dim;
+                if self.neon.load(Ordering::Relaxed) {
+                    let s = vdupq_n_f32(scalar);
+                    let mut i = 0usize;
+                    while i + 4 <= n {
+                        let va = vld1q_f32(a.as_ptr().add(i));
+                        let vr = vmulq_f32(va, s);
+                        vst1q_f32(out.as_mut_ptr().add(i), vr);
+                        i += 4;
+                    }
+                    while i < n { out[i] = a[i] * scalar; i += 1; }
+                } else {
+                    for i in 0..n { out[i] = a[i] * scalar; }
+                }
+            }
+            Ok(())
+        }
+
+        fn collective_consciousness(&self, fragments: &[&[Float]], out: &mut [Float]) -> Result<()> {
+            let cpu_field = CpuConsciousnessField::new(self.dim);
+            cpu_field.collective_consciousness(fragments, out)
+        }
+
+        fn inner_product(&self, a: &[Float], b: &[Float]) -> Result<Float> {
+            if a.len() != self.dim || b.len() != self.dim {
+                return Err(LingShuError::DimensionMismatch { expected: self.dim, got: a.len() });
+            }
+            unsafe {
+                if self.neon.load(Ordering::Relaxed) {
+                    Ok(Self::dot_neon(a.as_ptr(), b.as_ptr(), a.len()))
+                } else {
+                    Ok(kahan_inner_product(a, b))
+                }
+            }
+        }
+
+        fn to_fixed_consciousness(&self, a: &[Float], scale: f32, out: &mut [i32]) -> Result<()> {
+            let cpu_field = CpuConsciousnessField::new(self.dim);
+            cpu_field.to_fixed_consciousness(a, scale, out)
+        }
+
+        fn from_fixed_consciousness(&self, a: &[i32], scale: f32, out: &mut [Float]) -> Result<()> {
+            let cpu_field = CpuConsciousnessField::new(self.dim);
+            cpu_field.from_fixed_consciousness(a, scale, out)
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第10层：CUDA后端基础设施（设备管理、流池、内存分配）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "cuda")]
+mod cuda_backend {
+    use super::*;
+    use std::os::raw::{c_int, c_uint, c_void};
+    use std::ptr;
+    use libloading::{Library, Symbol};
+
+    /// CUDA错误枚举
+    #[derive(Debug)]
+    pub enum CudaError {
+        Runtime(String),
+        Cublas(String),
+        Other(String),
+    }
+
+    /// CUDA符号加载器
+    #[derive(Debug)]
+    struct CudaSymbols {
+        cuda_set_device: Symbol<'static, unsafe extern "C" fn(c_int) -> c_int>,
+        cuda_stream_create_with_flags: Symbol<'static, unsafe extern "C" fn(*mut *mut c_void, c_uint) -> c_int>,
+        cuda_stream_destroy: Symbol<'static, unsafe extern "C" fn(*mut c_void) -> c_int>,
+        cuda_malloc: Symbol<'static, unsafe extern "C" fn(*mut *mut c_void, usize) -> c_int>,
+        cuda_free: Symbol<'static, unsafe extern "C" fn(*mut c_void) -> c_int>,
+        cuda_memcpy_async: Symbol<'static, unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int, *mut c_void) -> c_int>,
+        cuda_device_synchronize: Symbol<'static, unsafe extern "C" fn() -> c_int>,
+    }
+
+    impl CudaSymbols {
+        unsafe fn load() -> Result<Self> {
+            let lib_names = ["libcudart.so", "libcudart.so.11.0", "libcudart.so.10.2"];
+            let mut lib_opt: Option<Library> = None;
+            for name in &lib_names {
+                if let Ok(l) = Library::new(name) {
+                    lib_opt = Some(l);
+                    break;
+                }
+            }
+            let lib = lib_opt.ok_or_else(|| LingShuError::FfiError("cuda runtime not found".into()))?;
+            let lib = Box::leak(Box::new(lib));
+
+            let cuda_set_device = lib.get::<unsafe extern "C" fn(c_int) -> c_int>(b"cudaSetDevice\0")
+                .map_err(|e| LingShuError::FfiError(format!("{:?}", e)))?;
+            let cuda_stream_create_with_flags = lib.get::<unsafe extern "C" fn(*mut *mut c_void, c_uint) -> c_int>(b"cudaStreamCreateWithFlags\0")
+                .map_err(|e| LingShuError::FfiError(format!("{:?}", e)))?;
+            let cuda_stream_destroy = lib.get::<unsafe extern "C" fn(*mut c_void) -> c_int>(b"cudaStreamDestroy\0")
+                .map_err(|e| LingShuError::FfiError(format!("{:?}", e)))?;
+            let cuda_malloc = lib.get::<unsafe extern "C" fn(*mut *mut c_void, usize) -> c_int>(b"cudaMalloc\0")
+                .map_err(|e| LingShuError::FfiError(format!("{:?}", e)))?;
+            let cuda_free = lib.get::<unsafe extern "C" fn(*mut c_void) -> c_int>(b"cudaFree\0")
+                .map_err(|e| LingShuError::FfiError(format!("{:?}", e)))?;
+            let cuda_memcpy_async = lib.get::<unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int, *mut c_void) -> c_int>(b"cudaMemcpyAsync\0")
+                .map_err(|e| LingShuError::FfiError(format!("{:?}", e)))?;
+            let cuda_device_synchronize = lib.get::<unsafe extern "C" fn() -> c_int>(b"cudaDeviceSynchronize\0")
+                .map_err(|e| LingShuError::FfiError(format!("{:?}", e)))?;
+
+            Ok(Self { cuda_set_device, cuda_stream_create_with_flags, cuda_stream_destroy,
+                cuda_malloc, cuda_free, cuda_memcpy_async, cuda_device_synchronize })
+        }
+    }
+
+    /// CUDA上下文：管理设备、流池、句柄池、内存池
+    #[derive(Debug)]
+    pub struct CudaContext {
+        pub device: i32,
+        pub streams: Mutex<Vec<*mut c_void>>,
+        pub mempool: Mutex<Vec<*mut c_void>>,
+        symbols: Arc<CudaSymbols>,
+    }
+
+    impl CudaContext {
+        pub fn new(device: i32, stream_count: usize) -> Result<Self> {
+            unsafe {
+                let symbols = Arc::new(CudaSymbols::load()?);
+                (symbols.cuda_set_device)(device);
+                let mut streams = Vec::with_capacity(stream_count);
+                for _ in 0..stream_count {
+                    let mut s: *mut c_void = ptr::null_mut();
+                    let flags: u32 = 0;
+                    let r = (symbols.cuda_stream_create_with_flags)(&mut s as *mut *mut c_void, flags);
+                    if r != 0 {
+                        return Err(LingShuError::FfiError(format!("cudaStreamCreateWithFlags failed: {}", r)));
+                    }
+                    streams.push(s);
+                }
+                Ok(Self { device, streams: Mutex::new(streams), mempool: Mutex::new(Vec::new()), symbols })
+            }
+        }
+
+        pub fn acquire_stream(&self) -> Result<*mut c_void> {
+            let mut s = self.streams.lock().unwrap();
+            if let Some(st) = s.pop() {
+                Ok(st)
+            } else {
+                unsafe {
+                    let mut st: *mut c_void = ptr::null_mut();
+                    let flags: u32 = 0;
+                    let r = (self.symbols.cuda_stream_create_with_flags)(&mut st as *mut *mut c_void, flags);
+                    if r != 0 {
+                        return Err(LingShuError::FfiError(format!("cudaStreamCreateWithFlags failed: {}", r)));
+                    }
+                    Ok(st)
+                }
+            }
+        }
+
+        pub fn release_stream(&self, stream: *mut c_void) {
+            let mut s = self.streams.lock().unwrap();
+            s.push(stream);
+        }
+
+        pub fn alloc(&self, bytes: usize) -> Result<*mut c_void> {
+            unsafe {
+                let mut ptr: *mut c_void = ptr::null_mut();
+                let r = (self.symbols.cuda_malloc)(&mut ptr as *mut *mut c_void, bytes);
+                if r != 0 {
+                    return Err(LingShuError::FfiError(format!("cudaMalloc failed: {}", r)));
+                }
+                Ok(ptr)
+            }
+        }
+
+        pub fn free(&self, ptr: *mut c_void) -> Result<()> {
+            unsafe {
+                let r = (self.symbols.cuda_free)(ptr);
+                if r != 0 {
+                    return Err(LingShuError::FfiError(format!("cudaFree failed: {}", r)));
+                }
+                Ok(())
+            }
+        }
+
+        pub fn memcpy_async(&self, dst: *mut c_void, src: *const c_void, bytes: usize, kind: i32, stream: *mut c_void) -> Result<()> {
+            unsafe {
+                let r = (self.symbols.cuda_memcpy_async)(dst, src, bytes, kind, stream);
+                if r != 0 {
+                    return Err(LingShuError::FfiError(format!("cudaMemcpyAsync failed: {}", r)));
+                }
+                Ok(())
+            }
+        }
+
+        pub fn synchronize(&self) -> Result<()> {
+            unsafe {
+                let r = (self.symbols.cuda_device_synchronize)();
+                if r != 0 {
+                    return Err(LingShuError::FfiError(format!("cudaDeviceSynchronize failed: {}", r)));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第11层：意识场后端选择器（枚举静态分发 + 动态降级路径）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub enum ConsciousnessFieldBackend {
+    Cpu(Arc<CpuConsciousnessField>),
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    SimdX86(Arc<dyn ConsciousnessField>),
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    SimdArm(Arc<dyn ConsciousnessField>),
+}
+
+impl ConsciousnessFieldBackend {
+    pub fn auto_select(dim: usize, _hal: &Hal) -> Self {
+        #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+        {
+            if _hal.supports(HardwareCapability::Avx2) {
+                use simd_x86::SimdX86ConsciousnessField;
+                return ConsciousnessFieldBackend::SimdX86(Arc::new(SimdX86ConsciousnessField::new(dim)));
+            }
+        }
+        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        {
+            if _hal.supports(HardwareCapability::Neon) {
+                use simd_arm::SimdArmConsciousnessField;
+                return ConsciousnessFieldBackend::SimdArm(Arc::new(SimdArmConsciousnessField::new(dim)));
+            }
+        }
+        ConsciousnessFieldBackend::Cpu(Arc::new(CpuConsciousnessField::new(dim)))
+    }
+}
+
+impl ConsciousnessField for ConsciousnessFieldBackend {
+    fn name(&self) -> &str {
+        match self {
+            ConsciousnessFieldBackend::Cpu(c) => c.name(),
+            #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+            ConsciousnessFieldBackend::SimdX86(s) => s.name(),
+            #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+            ConsciousnessFieldBackend::SimdArm(s) => s.name(),
+        }
+    }
+    fn dimension(&self) -> usize {
+        match self {
+            ConsciousnessFieldBackend::Cpu(c) => c.dimension(),
+            #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+            ConsciousnessFieldBackend::SimdX86(s) => s.dimension(),
+            #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+            ConsciousnessFieldBackend::SimdArm(s) => s.dimension(),
+        }
+    }
+    fn normalize_consciousness(&self, v: &mut [Float]) -> Result<()> {
+        match self {
+            ConsciousnessFieldBackend::Cpu(c) => c.normalize_consciousness(v),
+            #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+            ConsciousnessFieldBackend::SimdX86(s) => s.normalize_consciousness(v),
+            #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+            ConsciousnessFieldBackend::SimdArm(s) => s.normalize_consciousness(v),
+        }
+    }
+    fn resonance_degree(&self, a: &[Float], b: &[Float]) -> Result<Float> {
+        match self {
+            ConsciousnessFieldBackend::Cpu(c) => c.resonance_degree(a, b),
+            #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+            ConsciousnessFieldBackend::SimdX86(s) => s.resonance_degree(a, b),
+            #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+            ConsciousnessFieldBackend::SimdArm(s) => s.resonance_degree(a, b),
+        }
+    }
+    fn merge_consciousness(&self, a: &[Float], b: &[Float], out: &mut [Float]) -> Result<()> {
+        match self {
+            ConsciousnessFieldBackend::Cpu(c) => c.merge_consciousness(a, b, out),
+            #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+            ConsciousnessFieldBackend::SimdX86(s) => s.merge_consciousness(a, b, out),
+            #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+            ConsciousnessFieldBackend::SimdArm(s) => s.merge_consciousness(a, b, out),
+        }
+    }
+    fn differ_consciousness(&self, a: &[Float], b: &[Float], out: &mut [Float]) -> Result<()> {
+        match self {
+            ConsciousnessFieldBackend::Cpu(c) => c.differ_consciousness(a, b, out),
+            #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+            ConsciousnessFieldBackend::SimdX86(s) => s.differ_consciousness(a, b, out),
+            #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+            ConsciousnessFieldBackend::SimdArm(s) => s.differ_consciousness(a, b, out),
+        }
+    }
+    fn amplify_consciousness(&self, a: &[Float], scalar: Float, out: &mut [Float]) -> Result<()> {
+        match self {
+            ConsciousnessFieldBackend::Cpu(c) => c.amplify_consciousness(a, scalar, out),
+            #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+            ConsciousnessFieldBackend::SimdX86(s) => s.amplify_consciousness(a, scalar, out),
+            #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+            ConsciousnessFieldBackend::SimdArm(s) => s.amplify_consciousness(a, scalar, out),
+        }
+    }
+    fn collective_consciousness(&self, fragments: &[&[Float]], out: &mut [Float]) -> Result<()> {
+        match self {
+            ConsciousnessFieldBackend::Cpu(c) => c.collective_consciousness(fragments, out),
+            #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+            ConsciousnessFieldBackend::SimdX86(s) => s.collective_consciousness(fragments, out),
+            #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+            ConsciousnessFieldBackend::SimdArm(s) => s.collective_consciousness(fragments, out),
+        }
+    }
+    fn inner_product(&self, a: &[Float], b: &[Float]) -> Result<Float> {
+        match self {
+            ConsciousnessFieldBackend::Cpu(c) => c.inner_product(a, b),
+            #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+            ConsciousnessFieldBackend::SimdX86(s) => s.inner_product(a, b),
+            #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+            ConsciousnessFieldBackend::SimdArm(s) => s.inner_product(a, b),
+        }
+    }
+    fn to_fixed_consciousness(&self, a: &[Float], scale: f32, out: &mut [i32]) -> Result<()> {
+        match self {
+            ConsciousnessFieldBackend::Cpu(c) => c.to_fixed_consciousness(a, scale, out),
+            #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+            ConsciousnessFieldBackend::SimdX86(s) => s.to_fixed_consciousness(a, scale, out),
+            #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+            ConsciousnessFieldBackend::SimdArm(s) => s.to_fixed_consciousness(a, scale, out),
+        }
+    }
+    fn from_fixed_consciousness(&self, a: &[i32], scale: f32, out: &mut [Float]) -> Result<()> {
+        match self {
+            ConsciousnessFieldBackend::Cpu(c) => c.from_fixed_consciousness(a, scale, out),
+            #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+            ConsciousnessFieldBackend::SimdX86(s) => s.from_fixed_consciousness(a, scale, out),
+            #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+            ConsciousnessFieldBackend::SimdArm(s) => s.from_fixed_consciousness(a, scale, out),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第12层：意识索引Trait（从ling-shu-core引入，统一ANN接口）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 意识索引：统一抽象所有近似最近邻索引的核心操作
+/// 支持动态分发（Box<dyn ConsciousnessIndex>）和静态优化
+pub trait ConsciousnessIndex: Send + Sync + Debug {
+    /// 索引类型名称
+    fn name(&self) -> &str;
+    /// 向量维度
+    fn dimension(&self) -> usize;
+    /// 当前存储的向量数量（不含tombstone）
+    fn len(&self) -> usize;
+    /// 是否为空
+    fn is_empty(&self) -> bool { self.len() == 0 }
+
+    // 基本操作
+    /// 添加向量（&self签名要求内部可变性，ThreadSafe包装器提供）
+    fn add(&self, id: &str, vector: &[Float]) -> Result<()>;
+    /// 删除向量（tombstone机制）
+    fn remove(&self, id: &str) -> Result<()>;
+    /// 查询最近邻
+    fn query(&self, vector: &[Float], k: usize) -> Result<Vec<QueryResult>>;
+    /// 检查ID是否存在
+    fn contains(&self, id: &str) -> bool;
+
+    // 持久化
+    /// 保存索引到文件
+    fn persist(&self, path: &Path) -> Result<()>;
+    /// 从文件加载索引
+    fn load(&mut self, path: &Path) -> Result<()>;
+    /// 压缩索引（清理tombstone）
+    fn compact(&self) -> Result<usize>;
+
+    // 训练
+    /// 是否需要训练
+    fn needs_training(&self) -> bool { false }
+    /// 训练索引
+    fn train(&self, _data: &[Float], _params: &TrainParams) -> Result<()> { Ok(()) }
+    /// 是否已训练
+    fn is_trained(&self) -> bool { true }
+
+    // 审计
+    /// 获取审计日志（可选）
+    fn audit_log(&self) -> Option<&AuditLog> { None }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第13层：双向ID映射系统（从ling-shu-core引入）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// IdMap: 高效的String <-> u64双向映射，支持ID回收和压缩
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdMap {
+    str_to_num: HashMap<String, u64>,
+    num_to_str: HashMap<u64, String>,
+    next_num: u64,
+    free_list: Vec<u64>,
+}
+
+impl IdMap {
+    pub fn new() -> Self {
+        Self {
+            str_to_num: HashMap::new(),
+            num_to_str: HashMap::new(),
+            next_num: 0,
+            free_list: Vec::new(),
+        }
+    }
+
+    /// 插入字符串ID，返回分配的数字ID
+    pub fn insert(&mut self, id: String) -> Result<u64> {
+        if self.str_to_num.contains_key(&id) {
+            return Err(LingShuError::InvalidParameter(format!("duplicate id: {id}")));
+        }
+        let num = if let Some(n) = self.free_list.pop() {
+            n
+        } else {
+            let n = self.next_num;
+            self.next_num += 1;
+            n
+        };
+        self.str_to_num.insert(id.clone(), num);
+        self.num_to_str.insert(num, id);
+        Ok(num)
+    }
+
+    /// 根据字符串ID获取数字ID
+    pub fn get_num(&self, id: &str) -> Option<u64> {
+        self.str_to_num.get(id).copied()
+    }
+
+    /// 根据数字ID获取字符串ID
+    pub fn get_str(&self, num: u64) -> Option<&str> {
+        self.num_to_str.get(&num).map(|s| s.as_str())
+    }
+
+    /// 检查是否包含字符串ID
+    pub fn contains(&self, id: &str) -> bool {
+        self.str_to_num.contains_key(id)
+    }
+
+    /// 获取所有ID对
+    pub fn all_ids(&self) -> Vec<(String, u64)> {
+        self.str_to_num.iter().map(|(s, &n)| (s.clone(), n)).collect()
+    }
+
+    /// 压缩：回收未使用的数字ID
+    pub fn compact(&mut self) {
+        let used_nums: HashSet<u64> = self.str_to_num.values().copied().collect();
+        self.num_to_str.retain(|n, _| used_nums.contains(n));
+        self.free_list.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.str_to_num.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.str_to_num.is_empty()
+    }
+}
+
+impl Default for IdMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第14层：标准化持久化格式（从ling-shu-core引入）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 持久化文件头：魔术字节 + 版本 + 索引类型 + 维度 + 数量
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistenceHeader {
+    pub magic: [u8; 8],
+    pub version: u32,
+    pub index_kind: String,
+    pub dim: usize,
+    pub count: usize,
+    pub timestamp: u64,
+}
+
+impl PersistenceHeader {
+    pub const MAGIC: [u8; 8] = *b"LINGSHU\0";
+    pub const VERSION: u32 = 1;
+
+    pub fn new(index_kind: &str, dim: usize, count: usize) -> Self {
+        Self {
+            magic: Self::MAGIC,
+            version: Self::VERSION,
+            index_kind: index_kind.to_string(),
+            dim,
+            count,
+            timestamp: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        }
+    }
+
+    pub fn validate(&self, expected_kind: &str) -> Result<()> {
+        if self.magic != Self::MAGIC {
+            return Err(LingShuError::PersistenceError(
+                format!("Invalid magic bytes: expected {:?}, got {:?}", Self::MAGIC, self.magic)
+            ));
+        }
+        if self.version != Self::VERSION {
+            return Err(LingShuError::PersistenceError(
+                format!("Version mismatch: expected {}, got {}", Self::VERSION, self.version)
+            ));
+        }
+        if self.index_kind != expected_kind {
+            return Err(LingShuError::PersistenceError(
+                format!("Index kind mismatch: expected {}, got {}", expected_kind, self.index_kind)
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// 保存索引到文件（魔术头 + bincode序列化）
+pub fn save_to_file<T: Serialize>(path: &Path, header: &PersistenceHeader, data: &T) -> Result<()> {
+    use bincode::Options;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|e| LingShuError::IoError(e.to_string()))?;
+
+    let header_bytes = bincode::serialize(header)
+        .map_err(|e| LingShuError::SerializationError(e.to_string()))?;
+    let data_bytes = bincode::serialize(data)
+        .map_err(|e| LingShuError::SerializationError(e.to_string()))?;
+
+    // 写入长度前缀 + 数据
+    let header_len = header_bytes.len() as u64;
+    file.write_all(&header_len.to_le_bytes())
+        .map_err(|e| LingShuError::IoError(e.to_string()))?;
+    file.write_all(&header_bytes)
+        .map_err(|e| LingShuError::IoError(e.to_string()))?;
+
+    let data_len = data_bytes.len() as u64;
+    file.write_all(&data_len.to_le_bytes())
+        .map_err(|e| LingShuError::IoError(e.to_string()))?;
+    file.write_all(&data_bytes)
+        .map_err(|e| LingShuError::IoError(e.to_string()))?;
+
+    file.sync_all().map_err(|e| LingShuError::IoError(e.to_string()))?;
+    Ok(())
+}
+
+/// 从文件加载索引
+pub fn load_from_file<T: for<'de> Deserialize<'de>>(path: &Path, expected_kind: &str) -> Result<(PersistenceHeader, T)> {
+    use bincode::Options;
+    let mut file = File::open(path)
+        .map_err(|e| LingShuError::IoError(e.to_string()))?;
+
+    let mut header_len_buf = [0u8; 8];
+    file.read_exact(&mut header_len_buf)
+        .map_err(|e| LingShuError::IoError(e.to_string()))?;
+    let header_len = u64::from_le_bytes(header_len_buf) as usize;
+    let mut header_bytes = vec![0u8; header_len];
+    file.read_exact(&mut header_bytes)
+        .map_err(|e| LingShuError::IoError(e.to_string()))?;
+    let header: PersistenceHeader = bincode::deserialize(&header_bytes)
+        .map_err(|e| LingShuError::SerializationError(e.to_string()))?;
+    header.validate(expected_kind)?;
+
+    let mut data_len_buf = [0u8; 8];
+    file.read_exact(&mut data_len_buf)
+        .map_err(|e| LingShuError::IoError(e.to_string()))?;
+    let data_len = u64::from_le_bytes(data_len_buf) as usize;
+    let mut data_bytes = vec![0u8; data_len];
+    file.read_exact(&mut data_bytes)
+        .map_err(|e| LingShuError::IoError(e.to_string()))?;
+    let data: T = bincode::deserialize(&data_bytes)
+        .map_err(|e| LingShuError::SerializationError(e.to_string()))?;
+
+    Ok((header, data))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第15层：审计日志系统（从ling-shu-core引入，扩展认知变体）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 审计操作类型：记录所有对意识索引的变更操作
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AuditOp {
+    Add { id: String, dim: usize },
+    Remove { id: String },
+    Train { n_vectors: usize, params: String, seed: u64 },
+    Persist { path: String },
+    Load { path: String },
+    Compact { removed_count: usize },
+    // 新增：文件2认知系统需要的变体
+    ConsciousnessAssimilation { id: String, dim: usize },
+    CognitiveEvolution { id: String, generation: usize },
+    TemporalShift { id: String, delta: Float },
+    EmotionalResonance { id: String, tone: String },
+    EntanglementWeave { id: String, partners: Vec<String> },
+}
+
+/// 单条审计记录
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEntry {
+    pub timestamp: u64,
+    pub op: AuditOp,
+    pub detail: String,
+    pub seed: Option<u64>,
+}
+
+/// 审计日志：完整的操作历史追踪
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditLog {
+    entries: Vec<AuditEntry>,
+}
+
+impl AuditLog {
+    pub fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    /// 记录一条审计日志
+    pub fn record(&mut self, op: AuditOp, detail: &str, seed: Option<u64>) {
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.entries.push(AuditEntry {
+            timestamp,
+            op,
+            detail: detail.to_string(),
+            seed,
+        });
+    }
+
+    /// 获取所有审计记录
+    pub fn entries(&self) -> &[AuditEntry] {
+        &self.entries
+    }
+
+    /// 获取审计记录数量
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// 清空审计日志
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+impl Default for AuditLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PART 2: 认知演化层 + 记忆层 + 背景意识层 + ANN适配层 + LSH索引
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第16层：认知层级与配置
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 认知层级：意识的不同深度层次
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub enum CognitiveDepth {
+    Microscopic,
+    Macroscopic,
+    Profound,
+    Seed,
+}
+
+/// 认知演化引擎配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CognitiveEvolutionConfig {
+    pub input_dimension: usize,
+    pub microscopic_dimension: usize,
+    pub macroscopic_dimension: usize,
+    pub profound_dimension: usize,
+    pub seed_dimension: usize,
+    pub normalize_after_projection: bool,
+    pub learning_rate: Float,
+    pub regularization_strength: Float,
+    pub weight_initialization_scale: Float,
+    pub use_bias_term: bool,
+    pub enable_online_evolution: bool,
+}
+
+/// 认知演化引擎：融合多级投影与在线学习的意识升华机制
+pub trait CognitiveEvolutionEngine: Send + Sync + Debug {
+    fn configuration(&self) -> &CognitiveEvolutionConfig;
+    fn project_to_depth(&self, depth: CognitiveDepth, input: &[Float], output: &mut [Float]) -> Result<()>;
+    fn reverse_project(&self, depth: CognitiveDepth, deep_cognition: &[Float], output: &mut [Float]) -> Result<()>;
+    fn evolve_cognition(&self, depth: CognitiveDepth, experience: &[Float], target_cognition: &[Float]) -> Result<()>;
+    fn depth_dimension(&self, depth: CognitiveDepth) -> usize;
+    fn persist_cognitive_structure(&self) -> Result<Vec<u8>>;
+    fn load_cognitive_structure(&self, data: &[u8]) -> Result<()>;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第17层：写前日志（WAL）持久化
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "persistence")]
+#[derive(Debug)]
+pub struct WriteAheadLog {
+    pub path: String,
+    pub file: File,
+}
+
+#[cfg(feature = "persistence")]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum WalEntry {
+    ConsciousnessAssimilation {
+        id: String,
+        consciousness_vector: Vec<Float>,
+        temporal_context: HashMap<String, String>,
+        spatial_context: HashMap<String, String>,
+        emotional_valence: Float,
+        importance_weight: Float,
+        timestamp: u128,
+        crc: u32,
+    },
+    CognitiveEvolution {
+        depth: CognitiveDepth,
+        experience: Vec<Float>,
+        target: Vec<Float>,
+        timestamp: u128,
+        crc: u32,
+    },
+    Snapshot {
+        path: String,
+        timestamp: u128,
+        crc: u32,
+    },
+}
+
+#[cfg(feature = "persistence")]
+impl WriteAheadLog {
+    pub fn open(path: &str) -> Result<Self> {
+        let file = OpenOptions::new()
+            .create(true).append(true).read(true)
+            .open(path)
+            .map_err(|e| LingShuError::IoError(e.to_string()))?;
+        Ok(Self { path: path.to_string(), file })
+    }
+
+    pub fn append(&mut self, entry: &WalEntry) -> Result<()> {
+        use crc32fast::Hasher as Crc32;
+        let ser = serde_json::to_vec(entry).map_err(|e| LingShuError::IoError(e.to_string()))?;
+        let mut hasher = Crc32::new();
+        hasher.update(&ser);
+        let crc = hasher.finalize();
+        let mut entry_with_crc = entry.clone();
+        match &mut entry_with_crc {
+            WalEntry::ConsciousnessAssimilation { crc: c, .. } => *c = crc,
+            WalEntry::CognitiveEvolution { crc: c, .. } => *c = crc,
+            WalEntry::Snapshot { crc: c, .. } => *c = crc,
+        }
+        let ser = serde_json::to_vec(&entry_with_crc).map_err(|e| LingShuError::IoError(e.to_string()))?;
+        let len = ser.len() as u64;
+        self.file.write_all(&len.to_le_bytes()).map_err(|e| LingShuError::IoError(e.to_string()))?;
+        self.file.write_all(&ser).map_err(|e| LingShuError::IoError(e.to_string()))?;
+        self.file.sync_data().map_err(|e| LingShuError::IoError(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn replay(&mut self) -> Result<Vec<WalEntry>> {
+        self.file.seek(SeekFrom::Start(0)).map_err(|e| LingShuError::IoError(e.to_string()))?;
+        let mut res = Vec::new();
+        loop {
+            let mut len_buf = [0u8; 8];
+            match self.file.read_exact(&mut len_buf) {
+                Ok(_) => {}
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof { break; }
+                    return Err(LingShuError::IoError(e.to_string()));
+                }
+            }
+            let len = u64::from_le_bytes(len_buf) as usize;
+            let mut buf = vec![0u8; len];
+            self.file.read_exact(&mut buf).map_err(|e| LingShuError::IoError(e.to_string()))?;
+            if let Ok(entry) = serde_json::from_slice::<WalEntry>(&buf) {
+                res.push(entry);
+            } else { break; }
+        }
+        Ok(res)
+    }
+
+    pub fn take_snapshot_atomic(&mut self, snapshot_path: &str, data: &[u8]) -> Result<()> {
+        let tmp = format!("{}.tmp", snapshot_path);
+        {
+            let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(&tmp)
+                .map_err(|e| LingShuError::IoError(e.to_string()))?;
+            f.write_all(data).map_err(|e| LingShuError::IoError(e.to_string()))?;
+            f.sync_all().map_err(|e| LingShuError::IoError(e.to_string()))?;
+        }
+        std::fs::rename(&tmp, snapshot_path).map_err(|e| LingShuError::IoError(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn rotate_after_snapshot(&mut self) -> Result<()> {
+        self.file = OpenOptions::new().create(true).write(true).truncate(true).open(&self.path)
+            .map_err(|e| LingShuError::IoError(e.to_string()))?;
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第18层：线性认知演化引擎
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub struct LinearCognitiveEvolutionEngine {
+    config: CognitiveEvolutionConfig,
+    transformation_matrices: RwLock<HashMap<CognitiveDepth, Vec<Float>>>,
+    bias_vectors: RwLock<HashMap<CognitiveDepth, Vec<Float>>>,
+    field: ConsciousnessFieldBackend,
+    #[cfg(feature = "persistence")]
+    wal: Option<Arc<Mutex<WriteAheadLog>>>,
+}
+
+impl LinearCognitiveEvolutionEngine {
+    #[cfg(feature = "persistence")]
+    pub fn new(config: CognitiveEvolutionConfig, field: ConsciousnessFieldBackend, wal: Option<Arc<Mutex<WriteAheadLog>>>) -> Self {
+        let (matrices, biases) = Self::init_matrices(&config);
+        Self { config, transformation_matrices: RwLock::new(matrices), bias_vectors: RwLock::new(biases), field, wal }
+    }
+
+    #[cfg(not(feature = "persistence"))]
+    pub fn new(config: CognitiveEvolutionConfig, field: ConsciousnessFieldBackend) -> Self {
+        let (matrices, biases) = Self::init_matrices(&config);
+        Self { config, transformation_matrices: RwLock::new(matrices), bias_vectors: RwLock::new(biases), field }
+    }
+
+    fn init_matrices(config: &CognitiveEvolutionConfig) -> (HashMap<CognitiveDepth, Vec<Float>>, HashMap<CognitiveDepth, Vec<Float>>) {
+        let mut matrices = HashMap::new();
+        let mut biases = HashMap::new();
+        let scale = config.weight_initialization_scale.max(0.01);
+        let init_matrix = |out_d: usize, in_d: usize, sc: Float| -> Vec<Float> {
+            let mut rng = get_thread_rng();
+            let mut m = Vec::with_capacity(out_d * in_d);
+            for _ in 0..(out_d * in_d) {
+                let mut v = (rng.random::<f32>() - 0.5) * 2.0 * sc;
+                v = v.max(-3.0 * sc).min(3.0 * sc);
+                m.push(v);
+            }
+            m
+        };
+        matrices.insert(CognitiveDepth::Microscopic, init_matrix(config.microscopic_dimension, config.input_dimension, scale));
+        matrices.insert(CognitiveDepth::Macroscopic, init_matrix(config.macroscopic_dimension, config.input_dimension, scale));
+        matrices.insert(CognitiveDepth::Profound, init_matrix(config.profound_dimension, config.input_dimension, scale));
+        matrices.insert(CognitiveDepth::Seed, init_matrix(config.seed_dimension, config.input_dimension, scale));
+        biases.insert(CognitiveDepth::Microscopic, vec![0.0; config.microscopic_dimension]);
+        biases.insert(CognitiveDepth::Macroscopic, vec![0.0; config.macroscopic_dimension]);
+        biases.insert(CognitiveDepth::Profound, vec![0.0; config.profound_dimension]);
+        biases.insert(CognitiveDepth::Seed, vec![0.0; config.seed_dimension]);
+        (matrices, biases)
+    }
+
+    fn precise_matrix_vector_multiply(&self, matrix: &[Float], _rows: usize, cols: usize, vector: &[Float], output: &mut [Float]) {
+        output.par_iter_mut().enumerate().for_each(|(row_idx, output_element)| {
+            let base_index = row_idx * cols;
+            let mut accumulator = 0.0f64;
+            for col_idx in 0..cols {
+                accumulator += (matrix[base_index + col_idx] as f64) * (vector[col_idx] as f64);
+            }
+            *output_element = accumulator as Float;
+        });
+    }
+}
+
+impl CognitiveEvolutionEngine for LinearCognitiveEvolutionEngine {
+    fn configuration(&self) -> &CognitiveEvolutionConfig { &self.config }
+
+    fn project_to_depth(&self, depth: CognitiveDepth, input: &[Float], output: &mut [Float]) -> Result<()> {
+        if input.len() != self.config.input_dimension {
+            return Err(LingShuError::DimensionMismatch { expected: self.config.input_dimension, got: input.len() });
+        }
+        let output_dim = self.depth_dimension(depth);
+        if output.len() != output_dim {
+            return Err(LingShuError::DimensionMismatch { expected: output_dim, got: output.len() });
+        }
+        let matrices = self.transformation_matrices.read().unwrap();
+        let biases = self.bias_vectors.read().unwrap();
+        let matrix = matrices.get(&depth).ok_or(LingShuError::NotFound)?;
+        let bias = biases.get(&depth).ok_or(LingShuError::NotFound)?;
+        self.precise_matrix_vector_multiply(matrix, output_dim, self.config.input_dimension, input, output);
+        if self.config.use_bias_term {
+            output.par_iter_mut().enumerate().for_each(|(i, o)| { *o += bias[i]; });
+        }
+        if self.config.normalize_after_projection {
+            let norm = output.iter().map(|x| x * x).sum::<Float>().sqrt().max(1e-8);
+            output.par_iter_mut().for_each(|x| { *x /= norm; });
+        }
+        Ok(())
+    }
+
+    fn reverse_project(&self, depth: CognitiveDepth, deep_cognition: &[Float], output: &mut [Float]) -> Result<()> {
+        let deep_dim = self.depth_dimension(depth);
+        if deep_cognition.len() != deep_dim {
+            return Err(LingShuError::DimensionMismatch { expected: deep_dim, got: deep_cognition.len() });
+        }
+        if output.len() != self.config.input_dimension {
+            return Err(LingShuError::DimensionMismatch { expected: self.config.input_dimension, got: output.len() });
+        }
+        let matrices = self.transformation_matrices.read().unwrap();
+        let matrix = matrices.get(&depth).ok_or(LingShuError::NotFound)?;
+        output.par_iter_mut().enumerate().for_each(|(col_idx, output_element)| {
+            let mut accumulator = 0.0f64;
+            for row_idx in 0..deep_dim {
+                let mi = row_idx * self.config.input_dimension + col_idx;
+                accumulator += (matrix[mi] as f64) * (deep_cognition[row_idx] as f64);
+            }
+            *output_element = accumulator as Float;
+        });
+        if self.config.normalize_after_projection {
+            let norm = output.iter().map(|x| x * x).sum::<Float>().sqrt().max(1e-8);
+            output.par_iter_mut().for_each(|x| { *x /= norm; });
+        }
+        Ok(())
+    }
+
+    fn evolve_cognition(&self, depth: CognitiveDepth, experience: &[Float], target_cognition: &[Float]) -> Result<()> {
+        if !self.config.enable_online_evolution { return Ok(()); }
+        let deep_dim = self.depth_dimension(depth);
+        if target_cognition.len() != deep_dim {
+            return Err(LingShuError::DimensionMismatch { expected: deep_dim, got: target_cognition.len() });
+        }
+        if experience.len() != self.config.input_dimension {
+            return Err(LingShuError::DimensionMismatch { expected: self.config.input_dimension, got: experience.len() });
+        }
+        #[cfg(feature = "persistence")]
+        if let Some(wal) = &self.wal {
+            let mut wal = wal.lock().unwrap();
+            let entry = WalEntry::CognitiveEvolution {
+                depth, experience: experience.to_vec(), target: target_cognition.to_vec(),
+                timestamp: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0),
+                crc: 0,
+            };
+            wal.append(&entry)?;
+        }
+        let mut matrices = self.transformation_matrices.write().unwrap();
+        let mut biases = self.bias_vectors.write().unwrap();
+        let matrix = matrices.get_mut(&depth).ok_or(LingShuError::NotFound)?;
+        let bias = biases.get_mut(&depth).ok_or(LingShuError::NotFound)?;
+        let mut prediction = vec![0.0f32; deep_dim];
+        self.precise_matrix_vector_multiply(matrix, deep_dim, self.config.input_dimension, experience, &mut prediction);
+        if self.config.use_bias_term { for i in 0..deep_dim { prediction[i] += bias[i]; } }
+        let mut error = vec![0.0f64; deep_dim];
+        for i in 0..deep_dim { error[i] = (prediction[i] - target_cognition[i]) as f64; }
+        let lr = self.config.learning_rate as f64;
+        let reg = self.config.regularization_strength as f64;
+        let input_dim = self.config.input_dimension;
+        let mut grad_sq_acc = vec![1e-8f64; matrix.len()];
+        for i in 0..deep_dim {
+            let base = i * input_dim;
+            for j in 0..input_dim {
+                let wi = base + j;
+                let grad = error[i] * (experience[j] as f64) + reg * (matrix[wi] as f64);
+                grad_sq_acc[wi] = 0.9 * grad_sq_acc[wi] + 0.1 * grad * grad;
+                let adaptive_lr = lr / (grad_sq_acc[wi].sqrt() + 1e-8);
+                matrix[wi] = (matrix[wi] as f64 - adaptive_lr * grad) as f32;
+            }
+            if self.config.use_bias_term { bias[i] = (bias[i] as f64 - lr * error[i]) as f32; }
+        }
+        Ok(())
+    }
+
+    fn depth_dimension(&self, depth: CognitiveDepth) -> usize {
+        match depth {
+            CognitiveDepth::Microscopic => self.config.microscopic_dimension,
+            CognitiveDepth::Macroscopic => self.config.macroscopic_dimension,
+            CognitiveDepth::Profound => self.config.profound_dimension,
+            CognitiveDepth::Seed => self.config.seed_dimension,
+        }
+    }
+
+    fn persist_cognitive_structure(&self) -> Result<Vec<u8>> {
+        let matrices = self.transformation_matrices.read().unwrap();
+        let biases = self.bias_vectors.read().unwrap();
+        serde_json::to_vec(&(&*matrices, &*biases)).map_err(|e| LingShuError::BackendError(e.to_string()))
+    }
+
+    fn load_cognitive_structure(&self, data: &[u8]) -> Result<()> {
+        let (matrices, biases): (HashMap<CognitiveDepth, Vec<Float>>, HashMap<CognitiveDepth, Vec<Float>>) =
+            serde_json::from_slice(data).map_err(|e| LingShuError::BackendError(e.to_string()))?;
+        *self.transformation_matrices.write().unwrap() = matrices;
+        *self.bias_vectors.write().unwrap() = biases;
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第19层：记忆结构与检索结果
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn default_atomic_cell_instant() -> AtomicCell<Instant> { AtomicCell::new(Instant::now()) }
+fn default_atomic_cell_usize() -> AtomicCell<usize> { AtomicCell::new(0) }
+
+/// 时空记忆痕迹：融合意识向量与时空上下文的完整记忆单元
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MemoryTrace {
+    pub id: String,
+    pub consciousness_vector: Vec<Float>,
+    pub temporal_context: HashMap<String, String>,
+    pub spatial_context: HashMap<String, String>,
+    pub emotional_valence: Float,
+    pub importance_weight: Float,
+    #[serde(skip, default = "Instant::now")]
+    pub creation_time: Instant,
+    #[serde(skip, default = "default_atomic_cell_instant")]
+    pub last_access_time: AtomicCell<Instant>,
+    #[serde(skip, default = "default_atomic_cell_usize")]
+    pub access_count: AtomicCell<usize>,
+}
+
+impl Clone for MemoryTrace {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(), consciousness_vector: self.consciousness_vector.clone(),
+            temporal_context: self.temporal_context.clone(), spatial_context: self.spatial_context.clone(),
+            emotional_valence: self.emotional_valence, importance_weight: self.importance_weight,
+            creation_time: self.creation_time,
+            last_access_time: AtomicCell::new(self.last_access_time.load()),
+            access_count: AtomicCell::new(self.access_count.load()),
+        }
+    }
+}
+
+/// 记忆检索结果：多维度评分的检索输出
+#[derive(Debug, Clone)]
+pub struct MemoryRetrievalResult {
+    pub trace_id: String,
+    pub resonance_score: Float,
+    pub temporal_relevance: Float,
+    pub spatial_relevance: Float,
+    pub emotional_match: Float,
+    pub combined_score: Float,
+    pub memory_trace: Option<MemoryTrace>,
+}
+
+// QueryResult → MemoryRetrievalResult 转换（需要MemoryRetrievalResult定义在前）
+// 已在第3层定义Forward声明，此处补全实际转换逻辑在ConsciousnessIndex适配器中实现
+
+/// 记忆缓存项
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryItem {
+    pub id: String,
+    pub vector: Vec<Float>,
+    pub metadata: HashMap<String, String>,
+    #[serde(skip, default = "Instant::now")]
+    pub timestamp: Instant,
+}
+
+/// 搜索结果
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub id: String,
+    pub score: Float,
+    pub item: Option<MemoryItem>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第20层：分段纠缠缓存（高并发分段锁分离）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub struct SegmentedEntangledCache {
+    capacity: usize,
+    segments: usize,
+    queues: Vec<Mutex<VecDeque<String>>>,
+    maps: Vec<RwLock<HashMap<String, Arc<MemoryItem>>>>,
+}
+
+impl SegmentedEntangledCache {
+    pub fn new(capacity: usize, segments: usize) -> Self {
+        let mut queues = Vec::with_capacity(segments);
+        let mut maps = Vec::with_capacity(segments);
+        for _ in 0..segments {
+            queues.push(Mutex::new(VecDeque::with_capacity(capacity / segments + 1)));
+            maps.push(RwLock::new(HashMap::new()));
+        }
+        Self { capacity, segments, queues, maps }
+    }
+
+    fn segment_for(&self, id: &str) -> usize {
+        let h = simple_hash(id.as_bytes());
+        (h as usize) % self.segments
+    }
+
+    pub fn insert(&self, item: MemoryItem) {
+        let id = item.id.clone();
+        let arc = Arc::new(item);
+        let seg = self.segment_for(&id);
+        { self.maps[seg].write().unwrap().insert(id.clone(), arc); }
+        let mut q = self.queues[seg].lock().unwrap();
+        q.push_front(id.clone());
+        while q.len() > (self.capacity / self.segments + 1) {
+            if let Some(old) = q.pop_back() { self.maps[seg].write().unwrap().remove(&old); }
+        }
+    }
+
+    pub fn get(&self, id: &str) -> Option<Arc<MemoryItem>> {
+        let seg = self.segment_for(id);
+        self.maps[seg].read().unwrap().get(id).cloned()
+    }
+
+    pub fn query_similar(&self, query_vec: &[Float], vs: &dyn ConsciousnessField, k: usize) -> Result<Vec<SearchResult>> {
+        let mut heap: Vec<(Float, String, Arc<MemoryItem>)> = Vec::new();
+        for seg in 0..self.segments {
+            let map = self.maps[seg].read().unwrap();
+            for (id, item) in map.iter() {
+                let score = vs.resonance_degree(query_vec, &item.vector)
+                    .map_err(|e| LingShuError::BackendError(format!("{:?}", e)))?;
+                heap.push((score, id.clone(), item.clone()));
+            }
+        }
+        heap.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+        Ok(heap.into_iter().take(k).map(|(s, id, it)| SearchResult { id, score: s, item: Some((*it).clone()) }).collect())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第21层：时空记忆场（分段LRU + 时间衰减 + 情感匹配）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub struct SpatiotemporalMemoryField {
+    capacity: usize,
+    segment_count: usize,
+    segment_queues: Vec<Mutex<VecDeque<String>>>,
+    segment_memories: Vec<RwLock<HashMap<String, Arc<MemoryTrace>>>>,
+    time_decay_rate: f64,
+    base_time_constant: Duration,
+    field: ConsciousnessFieldBackend,
+    entangled_cache: Arc<SegmentedEntangledCache>,
+}
+
+impl SpatiotemporalMemoryField {
+    pub fn new(capacity: usize, segment_count: usize, field: ConsciousnessFieldBackend) -> Self {
+        let mut queues = Vec::with_capacity(segment_count);
+        let mut memories = Vec::with_capacity(segment_count);
+        let cap_per_seg = capacity / segment_count + 1;
+        for _ in 0..segment_count {
+            queues.push(Mutex::new(VecDeque::with_capacity(cap_per_seg)));
+            memories.push(RwLock::new(HashMap::new()));
+        }
+        let cache_cap = capacity * 2;
+        let cache_segs = segment_count * 2;
+        let entangled_cache = Arc::new(SegmentedEntangledCache::new(cache_cap, cache_segs));
+        Self { capacity, segment_count, segment_queues: queues, segment_memories: memories,
+            time_decay_rate: 0.1, base_time_constant: Duration::from_secs(3600), field, entangled_cache }
+    }
+
+    fn segment_for_id(&self, id: &str) -> usize {
+        let hash = simple_hash(id.as_bytes());
+        (hash as usize) % self.segment_count
+    }
+
+    fn calculate_temporal_decay(&self, trace: &MemoryTrace) -> f64 {
+        let elapsed = trace.creation_time.elapsed();
+        (-self.time_decay_rate * elapsed.as_secs_f64() / self.base_time_constant.as_secs_f64()).exp()
+    }
+
+    fn calculate_context_match(&self, trace_ctx: &HashMap<String, String>, query_ctx: Option<&HashMap<String, String>>) -> f64 {
+        if let Some(qctx) = query_ctx {
+            if qctx.is_empty() { return 1.0; }
+            let mut matches = 0;
+            let total = qctx.len();
+            for (key, value) in qctx {
+                if let Some(tv) = trace_ctx.get(key) { if tv == value { matches += 1; } }
+            }
+            matches as f64 / total as f64
+        } else { 1.0 }
+    }
+
+    fn calculate_combined_score(&self, resonance: Float, trace: &MemoryTrace,
+        query_temporal: Option<&HashMap<String, String>>, query_spatial: Option<&HashMap<String, String>>, query_emotion: Option<Float>) -> Float {
+        let mut score = resonance as f64;
+        score *= self.calculate_temporal_decay(trace);
+        let access_boost = 1.0 + (trace.access_count.load() as f64).ln() * 0.1;
+        score *= access_boost;
+        if let Some(qe) = query_emotion {
+            let emotional_distance = (trace.emotional_valence - qe).abs();
+            let emotional_similarity = (-emotional_distance as f64 * 2.0).exp();
+            score *= 0.7 + 0.3 * emotional_similarity;
+        }
+        let ctx_match = self.calculate_context_match(&trace.temporal_context, query_temporal) * 0.5
+            + self.calculate_context_match(&trace.spatial_context, query_spatial) * 0.5;
+        score *= 0.8 + 0.2 * ctx_match;
+        score as Float
+    }
+
+    pub fn store_trace(&self, trace: MemoryTrace) {
+        let id = trace.id.clone();
+        let arc_trace = Arc::new(trace);
+        let segment = self.segment_for_id(&id);
+        {
+            let mut memories = self.segment_memories[segment].write().unwrap();
+            memories.insert(id.clone(), arc_trace.clone());
+        }
+        {
+            let mut queue = self.segment_queues[segment].lock().unwrap();
+            queue.push_front(id.clone());
+            let max_seg_cap = self.capacity / self.segment_count + 1;
+            while queue.len() > max_seg_cap {
+                if let Some(old_id) = queue.pop_back() {
+                    self.segment_memories[segment].write().unwrap().remove(&old_id);
+                }
+            }
+        }
+        let memory_item = MemoryItem {
+            id: id.clone(), vector: arc_trace.consciousness_vector.clone(),
+            metadata: arc_trace.temporal_context.clone(), timestamp: Instant::now(),
+        };
+        self.entangled_cache.insert(memory_item);
+    }
+
+    pub fn retrieve_traces(&self, query_consciousness: &[Float], k: usize,
+        query_temporal: Option<&HashMap<String, String>>, query_spatial: Option<&HashMap<String, String>>,
+        query_emotion: Option<Float>) -> Result<Vec<MemoryRetrievalResult>> {
+        let mut candidates: Vec<MemoryRetrievalResult> = Vec::new();
+        let cache_results = self.entangled_cache.query_similar(query_consciousness, &self.field, k)?;
+        for result in cache_results {
+            if let Some(_item) = result.item {
+                candidates.push(MemoryRetrievalResult {
+                    trace_id: result.id, resonance_score: result.score,
+                    temporal_relevance: 1.0, spatial_relevance: 1.0, emotional_match: 1.0,
+                    combined_score: result.score, memory_trace: None,
+                });
+            }
+        }
+        if candidates.len() < k {
+            for segment in 0..self.segment_count {
+                let memories = self.segment_memories[segment].read().unwrap();
+                for (id, trace) in memories.iter() {
+                    let resonance = self.field.resonance_degree(query_consciousness, &trace.consciousness_vector)?;
+                    trace.last_access_time.store(Instant::now());
+                    trace.access_count.fetch_add(1);
+                    let combined = self.calculate_combined_score(resonance, trace, query_temporal, query_spatial, query_emotion);
+                    candidates.push(MemoryRetrievalResult {
+                        trace_id: id.clone(), resonance_score: resonance,
+                        temporal_relevance: self.calculate_temporal_decay(trace) as Float,
+                        spatial_relevance: self.calculate_context_match(&trace.spatial_context, query_spatial) as Float,
+                        emotional_match: if let Some(qe) = query_emotion {
+                            let dist = (trace.emotional_valence - qe).abs();
+                            (-dist as f64 * 2.0).exp() as Float
+                        } else { 1.0 },
+                        combined_score: combined,
+                        memory_trace: Some((**trace).clone()),
+                    });
+                }
+            }
+        }
+        candidates.sort_by(|a, b| b.combined_score.partial_cmp(&a.combined_score).unwrap_or(Ordering::Equal));
+        Ok(candidates.into_iter().take(k).collect())
+    }
+
+    pub fn get_trace(&self, id: &str) -> Option<Arc<MemoryTrace>> {
+        let segment = self.segment_for_id(id);
+        let memories = self.segment_memories[segment].read().unwrap();
+        if let Some(trace) = memories.get(id) {
+            trace.last_access_time.store(Instant::now());
+            trace.access_count.fetch_add(1);
+            Some(trace.clone())
+        } else { None }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第22层：背景意识流（均值/方差/异常检测/Z-Score）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub struct BackgroundConsciousnessStream {
+    collective_mean: RwLock<Vec<f64>>,
+    experience_count: AtomicCell<usize>,
+    dimension: usize,
+    variance_accumulator: RwLock<Vec<f64>>,
+}
+
+impl BackgroundConsciousnessStream {
+    pub fn new(dimension: usize) -> Self {
+        Self { collective_mean: RwLock::new(vec![0.0; dimension]), experience_count: AtomicCell::new(0),
+            dimension, variance_accumulator: RwLock::new(vec![0.0; dimension]) }
+    }
+
+    pub fn assimilate_experience(&self, consciousness: &[Float]) -> Result<()> {
+        if consciousness.len() != self.dimension {
+            return Err(LingShuError::DimensionMismatch { expected: self.dimension, got: consciousness.len() });
+        }
+        let new_count = self.experience_count.fetch_add(1) + 1;
+        let n = new_count as f64;
+        let mut mean = self.collective_mean.write().unwrap();
+        let mut variance = self.variance_accumulator.write().unwrap();
+        for i in 0..self.dimension {
+            let old_mean = mean[i];
+            let new_value = consciousness[i] as f64;
+            mean[i] = old_mean + (new_value - old_mean) / n;
+            variance[i] += (new_value - old_mean) * (new_value - mean[i]);
+        }
+        Ok(())
+    }
+
+    pub fn get_collective_mean(&self) -> Vec<Float> {
+        self.collective_mean.read().unwrap().iter().map(|&x| x as Float).collect()
+    }
+
+    pub fn get_variance(&self) -> Vec<Float> {
+        let count = self.experience_count.load();
+        if count < 2 { return vec![0.0; self.dimension]; }
+        let variance = self.variance_accumulator.read().unwrap();
+        let n = count as f64;
+        variance.iter().map(|&v| (v / (n - 1.0)) as Float).collect()
+    }
+
+    pub fn calculate_anomaly_score(&self, consciousness: &[Float]) -> Result<Float> {
+        if consciousness.len() != self.dimension {
+            return Err(LingShuError::DimensionMismatch { expected: self.dimension, got: consciousness.len() });
+        }
+        let mean = self.collective_mean.read().unwrap();
+        let variance = self.get_variance();
+        let mut anomaly_score = 0.0f64;
+        for i in 0..self.dimension {
+            let deviation = (consciousness[i] as f64) - mean[i];
+            let std_dev = (variance[i] as f64).sqrt().max(1e-8);
+            anomaly_score += (deviation / std_dev).powi(2);
+        }
+        Ok((anomaly_score / self.dimension as f64).sqrt() as Float)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第23层：ANN适配层 — 兼容接口（ConsciousnessIndex → ApproximateNearestNeighborSearch）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 近似最近邻搜索抽象（文件2原有接口，保留以兼容LingShuCore）
+/// 新的索引实现ConsciousnessIndex通过适配器与此接口桥接
+pub trait ApproximateNearestNeighborSearch: Send + Sync + Debug {
+    fn add_consciousness(&self, id: &str, vector: &[Float]) -> Result<()>;
+    fn search_consciousness(&self, query: &[Float], k: usize) -> Result<Vec<MemoryRetrievalResult>>;
+    fn remove_consciousness(&self, id: &str) -> Result<()>;
+    fn consciousness_count(&self) -> usize;
+}
+
+/// ConsciousnessIndex → ApproximateNearestNeighborSearch 适配器
+/// 让新的工业级索引（LSH/HNSW/IVF）无缝接入LingShuCore
+#[derive(Debug)]
+pub struct ConsciousnessIndexAdapter {
+    inner: Arc<dyn ConsciousnessIndex + Send + Sync>,
+}
+
+impl ConsciousnessIndexAdapter {
+    pub fn new(inner: Arc<dyn ConsciousnessIndex + Send + Sync>) -> Self {
+        Self { inner }
+    }
+}
+
+impl ApproximateNearestNeighborSearch for ConsciousnessIndexAdapter {
+    fn add_consciousness(&self, id: &str, vector: &[Float]) -> Result<()> {
+        self.inner.add(id, vector)
+    }
+
+    fn search_consciousness(&self, query: &[Float], k: usize) -> Result<Vec<MemoryRetrievalResult>> {
+        let results = self.inner.query(query, k)?;
+        Ok(results.into_iter().map(|qr| qr.into()).collect())
+    }
+
+    fn remove_consciousness(&self, id: &str) -> Result<()> {
+        self.inner.remove(id)
+    }
+
+    fn consciousness_count(&self) -> usize {
+        self.inner.len()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第24层：原生暴力扫描索引（文件2保留，标记为deprecated，作为保底方案）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 原生暴力线性扫描索引（保留兼容，不推荐用于生产）
+/// 已被NativeConsciousnessIndex（LSH）取代，但保留作为最小依赖保底
+#[derive(Debug)]
+pub struct BruteForceConsciousnessIndex {
+    dimension: usize,
+    consciousness_map: RwLock<HashMap<String, Vec<Float>>>,
+}
+
+impl BruteForceConsciousnessIndex {
+    pub fn new(dimension: usize) -> Self {
+        Self { dimension, consciousness_map: RwLock::new(HashMap::new()) }
+    }
+}
+
+impl ApproximateNearestNeighborSearch for BruteForceConsciousnessIndex {
+    fn add_consciousness(&self, id: &str, vector: &[Float]) -> Result<()> {
+        if vector.len() != self.dimension {
+            return Err(LingShuError::DimensionMismatch { expected: self.dimension, got: vector.len() });
+        }
+        self.consciousness_map.write().unwrap().insert(id.to_string(), vector.to_vec());
+        Ok(())
+    }
+
+    fn search_consciousness(&self, query: &[Float], k: usize) -> Result<Vec<MemoryRetrievalResult>> {
+        if query.len() != self.dimension {
+            return Err(LingShuError::DimensionMismatch { expected: self.dimension, got: query.len() });
+        }
+        let map = self.consciousness_map.read().unwrap();
+        let mut candidates: Vec<(Float, String)> = Vec::with_capacity(map.len());
+        for (id, vector) in map.iter() {
+            let score = kahan_inner_product(query, vector);
+            candidates.push((score, id.clone()));
+        }
+        candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+        Ok(candidates.into_iter().take(k).map(|(score, id)| MemoryRetrievalResult {
+            trace_id: id, resonance_score: score, temporal_relevance: 1.0,
+            spatial_relevance: 1.0, emotional_match: 1.0, combined_score: score, memory_trace: None,
+        }).collect())
+    }
+
+    fn remove_consciousness(&self, id: &str) -> Result<()> {
+        self.consciousness_map.write().unwrap().remove(id).ok_or(LingShuError::NotFound)?;
+        Ok(())
+    }
+
+    fn consciousness_count(&self) -> usize {
+        self.consciousness_map.read().unwrap().len()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第25层：FAISS C API 绑定（动态加载，保留文件2完整实现）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "faiss")]
+mod faiss_bindings {
+    use super::*;
+    use std::os::raw::{c_char, c_int, c_longlong, c_void};
+    use std::ptr;
+    use libloading::Library as DynLib;
+
+    #[repr(C)]
+    struct FaissIndexOpaque { _private: [u8; 0], }
+    type FaissIndex = FaissIndexOpaque;
+    type idx_t = i64;
+
+    struct FaissSymbols {
+        faiss_index_factory: Symbol<'static, unsafe extern "C" fn(c_int, *const c_char, c_int) -> *mut FaissIndex>,
+        faiss_index_add: Symbol<'static, unsafe extern "C" fn(*mut FaissIndex, idx_t, *const f32) -> c_int>,
+        faiss_index_search: Symbol<'static, unsafe extern "C" fn(*mut FaissIndex, idx_t, *const f32, idx_t, *mut f32, *mut idx_t) -> c_int>,
+        faiss_index_train: Symbol<'static, unsafe extern "C" fn(*mut FaissIndex, idx_t, *const f32) -> c_int>,
+        faiss_index_reset: Symbol<'static, unsafe extern "C" fn(*mut FaissIndex) -> c_int>,
+        faiss_index_free: Symbol<'static, unsafe extern "C" fn(*mut FaissIndex)>,
+        faiss_index_ntotal: Symbol<'static, unsafe extern "C" fn(*mut FaissIndex) -> idx_t>,
+        faiss_index_write: Symbol<'static, unsafe extern "C" fn(*mut FaissIndex, *const c_char) -> c_int>,
+        faiss_index_read: Symbol<'static, unsafe extern "C" fn(*const c_char) -> *mut FaissIndex>,
+    }
+
+    impl FaissSymbols {
+        unsafe fn load() -> Result<Self> {
+            let lib_names = ["libfaiss_c.so", "libfaiss_c.so.1"];
+            let mut lib_opt: Option<DynLib> = None;
+            for name in &lib_names {
+                if let Ok(l) = DynLib::new(name) { lib_opt = Some(l); break; }
+            }
+            let lib = lib_opt.ok_or_else(|| LingShuError::FfiError("libfaiss_c not found".into()))?;
+            let lib = Box::leak(Box::new(lib));
+            macro_rules! get_sym {
+                ($name:expr) => {
+                    lib.get($name).map_err(|e| LingShuError::FfiError(format!("{:?}", e)))?
+                };
+            }
+            Ok(Self {
+                faiss_index_factory: get_sym!(b"faiss_index_factory\0"),
+                faiss_index_add: get_sym!(b"faiss_index_add\0"),
+                faiss_index_search: get_sym!(b"faiss_index_search\0"),
+                faiss_index_train: get_sym!(b"faiss_index_train\0"),
+                faiss_index_reset: get_sym!(b"faiss_index_reset\0"),
+                faiss_index_free: get_sym!(b"faiss_index_free\0"),
+                faiss_index_ntotal: get_sym!(b"faiss_index_ntotal\0"),
+                faiss_index_write: get_sym!(b"faiss_index_write\0"),
+                faiss_index_read: get_sym!(b"faiss_index_read\0"),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct FaissConsciousnessIndex {
+        dimension: usize,
+        idx: Mutex<*mut FaissIndex>,
+        symbols: Arc<FaissSymbols>,
+        #[allow(dead_code)] description: String,
+    }
+
+    impl FaissConsciousnessIndex {
+        pub fn new(dimension: usize, description: &str) -> Result<Self> {
+            unsafe {
+                let symbols = Arc::new(FaissSymbols::load()?);
+                let cdesc = CString::new(description).map_err(|e| LingShuError::FfiError(e.to_string()))?;
+                let p = (symbols.faiss_index_factory)(dimension as c_int, cdesc.as_ptr(), 0);
+                if p.is_null() {
+                    return Err(LingShuError::FfiError("faiss_index_factory returned null".into()));
+                }
+                Ok(Self { dimension, idx: Mutex::new(p), symbols, description: description.to_string() })
+            }
+        }
+
+        pub fn train_index(&self, training_data: &[f32]) -> Result<()> {
+            if training_data.len() % self.dimension != 0 {
+                return Err(LingShuError::InvalidParameter("training data length not multiple of dimension".into()));
+            }
+            unsafe {
+                let p = *self.idx.lock().unwrap();
+                if p.is_null() { return Err(LingShuError::FfiError("null index ptr".into())); }
+                let n = (training_data.len() / self.dimension) as idx_t;
+                let r = (self.symbols.faiss_index_train)(p, n, training_data.as_ptr());
+                if r != 0 { return Err(LingShuError::FfiError(format!("faiss_index_train error: {}", r))); }
+                Ok(())
+            }
+        }
+
+        pub fn add(&self, vectors: &[f32]) -> Result<()> {
+            if vectors.len() % self.dimension != 0 {
+                return Err(LingShuError::InvalidParameter("vector data length not multiple of dimension".into()));
+            }
+            unsafe {
+                let p = *self.idx.lock().unwrap();
+                if p.is_null() { return Err(LingShuError::FfiError("null index ptr".into())); }
+                let n = (vectors.len() / self.dimension) as idx_t;
+                let r = (self.symbols.faiss_index_add)(p, n, vectors.as_ptr());
+                if r != 0 { return Err(LingShuError::FfiError(format!("faiss_index_add error: {}", r))); }
+                Ok(())
+            }
+        }
+
+        pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(i64, f32)>> {
+            if query.len() != self.dimension {
+                return Err(LingShuError::InvalidParameter("query dimension mismatch".into()));
+            }
+            unsafe {
+                let p = *self.idx.lock().unwrap();
+                if p.is_null() { return Err(LingShuError::FfiError("null index ptr".into())); }
+                let mut distances = vec![0f32; k];
+                let mut labels = vec![0i64; k];
+                let r = (self.symbols.faiss_index_search)(p, 1 as idx_t, query.as_ptr(), k as idx_t, distances.as_mut_ptr(), labels.as_mut_ptr());
+                if r != 0 { return Err(LingShuError::FfiError(format!("faiss_index_search error: {}", r))); }
+                Ok((0..k).map(|i| (labels[i], distances[i])).collect())
+            }
+        }
+
+        pub fn save(&self, path: &str) -> Result<()> {
+            unsafe {
+                let p = *self.idx.lock().unwrap();
+                if p.is_null() { return Err(LingShuError::FfiError("null index ptr".into())); }
+                let cpath = CString::new(path).map_err(|e| LingShuError::FfiError(e.to_string()))?;
+                let r = (self.symbols.faiss_index_write)(p, cpath.as_ptr());
+                if r != 0 { return Err(LingShuError::FfiError(format!("faiss_index_write error: {}", r))); }
+                Ok(())
+            }
+        }
+
+        pub fn load(path: &str) -> Result<Self> {
+            unsafe {
+                let symbols = Arc::new(FaissSymbols::load()?);
+                let cpath = CString::new(path).map_err(|e| LingShuError::FfiError(e.to_string()))?;
+                let p = (symbols.faiss_index_read)(cpath.as_ptr());
+                if p.is_null() { return Err(LingShuError::FfiError("faiss_index_read returned null".into())); }
+                Ok(Self { dimension: 0, idx: Mutex::new(p), symbols, description: "loaded".to_string() })
+            }
+        }
+
+        pub fn ntotal(&self) -> usize {
+            unsafe {
+                let p = *self.idx.lock().unwrap();
+                if p.is_null() { return 0; }
+                (self.symbols.faiss_index_ntotal)(p) as usize
+            }
+        }
+    }
+
+    impl Drop for FaissConsciousnessIndex {
+        fn drop(&mut self) {
+            let p = *self.idx.lock().unwrap();
+            if !p.is_null() { unsafe { (self.symbols.faiss_index_free)(p); } }
+        }
+    }
+
+    impl super::ApproximateNearestNeighborSearch for FaissConsciousnessIndex {
+        fn add_consciousness(&self, _id: &str, vector: &[Float]) -> Result<()> {
+            if vector.len() != self.dimension {
+                return Err(LingShuError::DimensionMismatch { expected: self.dimension, got: vector.len() });
+            }
+            self.add(vector)?;
+            Ok(())
+        }
+        fn search_consciousness(&self, query: &[Float], k: usize) -> Result<Vec<MemoryRetrievalResult>> {
+            if query.len() != self.dimension {
+                return Err(LingShuError::DimensionMismatch { expected: self.dimension, got: query.len() });
+            }
+            let results = self.search(query, k)?;
+            Ok(results.into_iter().map(|(id, score)| MemoryRetrievalResult {
+                trace_id: format!("{}", id), resonance_score: score, temporal_relevance: 1.0,
+                spatial_relevance: 1.0, emotional_match: 1.0, combined_score: score, memory_trace: None,
+            }).collect())
+        }
+        fn remove_consciousness(&self, _id: &str) -> Result<()> {
+            Err(LingShuError::InvalidParameter("FAISS C API does not support single remove".into()))
+        }
+        fn consciousness_count(&self) -> usize { self.ntotal() }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第26层：HNSW原生实现（文件2保留，#[cfg(feature = "hnsw)]条件编译）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "hnsw")]
+pub mod hnsw {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::collections::HashSet;
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct OrderedF32(f32);
+    impl Eq for OrderedF32 {}
+    impl PartialOrd for OrderedF32 {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            self.0.partial_cmp(&other.0)
+        }
+    }
+    impl Ord for OrderedF32 {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.0.partial_cmp(&other.0).unwrap_or(std::cmp::Ordering::Equal)
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct HnswConfig {
+        pub dim: usize,
+        #[allow(dead_code)] pub max_links: usize,
+        pub ef_construction: usize,
+        pub ef_search: usize,
+        pub m: usize,
+        pub seed: u64,
+    }
+
+    #[derive(Debug)]
+    struct Node {
+        #[allow(dead_code)] id: usize,
+        vector: Vec<Float>,
+        #[allow(dead_code)] level: usize,
+        neighbors: RwLock<Vec<Vec<usize>>>,
+    }
+
+    impl Node {
+        fn new(id: usize, vector: Vec<Float>, level: usize, max_level: usize) -> Self {
+            let mut nb = Vec::with_capacity(max_level + 1);
+            for _ in 0..=max_level { nb.push(Vec::new()); }
+            Self { id, vector, level, neighbors: RwLock::new(nb) }
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct HnswIndex {
+        cfg: HnswConfig,
+        nodes: RwLock<HashMap<usize, Arc<Node>>>,
+        enter_point: RwLock<Option<usize>>,
+        max_level: AtomicUsize,
+        id_counter: AtomicUsize,
+    }
+
+    impl HnswIndex {
+        pub fn new(cfg: HnswConfig) -> Self {
+            Self { cfg, nodes: RwLock::new(HashMap::new()), enter_point: RwLock::new(None),
+                max_level: AtomicUsize::new(0), id_counter: AtomicUsize::new(0) }
+        }
+
+        fn random_level(&self) -> usize {
+            let mut lvl = 0usize;
+            let mut rng = get_thread_rng();
+            while rng.random::<f32>() < 1.0 / (self.cfg.m as f32) && lvl < 32 { lvl += 1; }
+            lvl
+        }
+
+        pub fn insert(&self, vector: Vec<Float>) -> Result<usize> {
+            if vector.len() != self.cfg.dim {
+                return Err(LingShuError::InvalidParameter("dimension mismatch".into()));
+            }
+            let id = self.id_counter.fetch_add(1, Ordering::SeqCst);
+            let level = self.random_level();
+            let node = Arc::new(Node::new(id, vector, level, level));
+            { self.nodes.write().unwrap().insert(id, node.clone()); }
+            let mut ep_guard = self.enter_point.write().unwrap();
+            if ep_guard.is_none() {
+                *ep_guard = Some(id);
+                self.max_level.store(level, Ordering::SeqCst);
+                return Ok(id);
+            }
+            let ep = ep_guard.unwrap();
+            drop(ep_guard);
+            let mut curr = ep;
+            let max_lvl = self.max_level.load(Ordering::SeqCst);
+            for l in (level + 1..=max_lvl).rev() {
+                curr = self.search_layer_greedy(curr, &node.vector, l)?;
+            }
+            for l in (0..=level).rev() {
+                let candidates = self.search_layer(&node.vector, self.cfg.ef_construction, l)?;
+                let chosen: Vec<usize> = candidates.into_iter().take(self.cfg.m).collect();
+                for &nid in &chosen {
+                    if let Some(n) = self.nodes.read().unwrap().get(&nid) {
+                        let mut nb = n.neighbors.write().unwrap();
+                        if nb[l].len() < self.cfg.m { nb[l].push(id); }
+                    }
+                }
+                let mut my_nb = node.neighbors.write().unwrap();
+                my_nb[l] = chosen;
+            }
+            if level > self.max_level.load(Ordering::SeqCst) {
+                self.max_level.store(level, Ordering::SeqCst);
+                let mut ep = self.enter_point.write().unwrap();
+                *ep = Some(id);
+            }
+            Ok(id)
+        }
+
+        fn search_layer_greedy(&self, start: usize, query: &[Float], level: usize) -> Result<usize> {
+            let nodes = self.nodes.read().unwrap();
+            let mut curr = start;
+            let mut changed = true;
+            while changed {
+                changed = false;
+                let node = nodes.get(&curr).ok_or(LingShuError::NotFound)?;
+                let nb = node.neighbors.read().unwrap();
+                for &nidx in &nb[level] {
+                    let nnode = nodes.get(&nidx).ok_or(LingShuError::NotFound)?;
+                    let dcurr = dot_kahan(&node.vector, query);
+                    let dnb = dot_kahan(&nnode.vector, query);
+                    if dnb > dcurr { curr = nidx; changed = true; }
+                }
+            }
+            Ok(curr)
+        }
+
+        fn search_layer(&self, query: &[Float], ef: usize, level: usize) -> Result<Vec<usize>> {
+            let nodes = self.nodes.read().unwrap();
+            let ep_opt = *self.enter_point.read().unwrap();
+            if ep_opt.is_none() { return Ok(Vec::new()); }
+            let ep = ep_opt.unwrap();
+            let mut visited = HashSet::new();
+            let mut candidates: BinaryHeap<(OrderedF32, usize)> = BinaryHeap::new();
+            let mut result: BinaryHeap<Reverse<(OrderedF32, usize)>> = BinaryHeap::new();
+            let start_node = nodes.get(&ep).ok_or(LingShuError::NotFound)?;
+            let start_score = dot_kahan(&start_node.vector, query);
+            candidates.push((OrderedF32(start_score), ep));
+            visited.insert(ep);
+            while let Some((score, vid)) = candidates.pop() {
+                if result.len() < ef {
+                    result.push(Reverse((score, vid)));
+                } else if let Some(&Reverse((ref wscore, _))) = result.peek() {
+                    if score > *wscore { result.pop(); result.push(Reverse((score, vid))); }
+                }
+                if let Some(node) = nodes.get(&vid) {
+                    let nb = node.neighbors.read().unwrap();
+                    for &nidx in &nb[level] {
+                        if visited.insert(nidx) {
+                            let nnode = nodes.get(&nidx).ok_or(LingShuError::NotFound)?;
+                            let sc = dot_kahan(&nnode.vector, query);
+                            candidates.push((OrderedF32(sc), nidx));
+                        }
+                    }
+                }
+            }
+            let mut out: Vec<(OrderedF32, usize)> = result.into_iter().map(|Reverse((s, i))| (s, i)).collect();
+            out.sort_by(|a, b| b.0.cmp(&a.0));
+            Ok(out.into_iter().map(|(_, id)| id).collect())
+        }
+
+        pub fn search(&self, query: &[Float], k: usize) -> Result<Vec<(usize, Float)>> {
+            let ef = self.cfg.ef_search.max(k);
+            let ids = self.search_layer(query, ef, 0)?;
+            let nodes = self.nodes.read().unwrap();
+            let mut scored: Vec<(usize, Float)> = ids.into_iter().map(|id| {
+                let v = nodes.get(&id).unwrap();
+                (id, dot_kahan(&v.vector, query))
+            }).collect();
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+            scored.truncate(k);
+            Ok(scored)
+        }
+
+        pub fn remove(&self, id: usize) -> Result<()> {
+            let mut nodes = self.nodes.write().unwrap();
+            if !nodes.contains_key(&id) { return Err(LingShuError::NotFound); }
+            for (_nid, node) in nodes.iter() {
+                let mut nb = node.neighbors.write().unwrap();
+                for lvl in 0..nb.len() { nb[lvl].retain(|&x| x != id); }
+            }
+            nodes.remove(&id);
+            Ok(())
+        }
+    }
+
+    impl super::ApproximateNearestNeighborSearch for HnswIndex {
+        fn add_consciousness(&self, _id: &str, vector: &[Float]) -> Result<()> {
+            let _node_id = self.insert(vector.to_vec())?;
+            Ok(())
+        }
+        fn search_consciousness(&self, query: &[Float], k: usize) -> Result<Vec<MemoryRetrievalResult>> {
+            let results = self.search(query, k)?;
+            Ok(results.into_iter().map(|(id, score)| MemoryRetrievalResult {
+                trace_id: id.to_string(), resonance_score: score, temporal_relevance: 1.0,
+                spatial_relevance: 1.0, emotional_match: 1.0, combined_score: score, memory_trace: None,
+            }).collect())
+        }
+        fn remove_consciousness(&self, id: &str) -> Result<()> {
+            let node_id = id.parse::<usize>().map_err(|_| LingShuError::InvalidParameter("invalid ID".into()))?;
+            self.remove(node_id)
+        }
+        fn consciousness_count(&self) -> usize { self.nodes.read().unwrap().len() }
+    }
+
+    fn dot_kahan(a: &[Float], b: &[Float]) -> Float {
+        let mut sum = 0.0f64;
+        let mut c = 0.0f64;
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            let prod = (x as f64) * (y as f64);
+            let y2 = prod - c;
+            let t = sum + y2;
+            c = (t - sum) - y2;
+            sum = t;
+        }
+        sum as Float
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第27层：NativeConsciousnessIndex — 多表随机超平面LSH（从ling-shu-core引入）
+// 替代文件2的暴力扫描，成为<1K数据规模的默认索引
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Serialize, Deserialize)]
+struct LshSnapshot {
+    dim: usize,
+    n_tables: usize,
+    n_bits: usize,
+    seed: u64,
+    hyperplanes: Vec<Vec<Vec<Float>>>,
+    tables: Vec<HashMap<u64, Vec<u64>>>,
+    vectors: HashMap<u64, Vec<Float>>,
+    id_map_fwd: Vec<(String, u64)>,
+    tombstones: Vec<u64>,
+}
+
+/// 多表LSH近似最近邻索引
+/// 使用随机超平面将向量空间哈希到多个表中，通过桶碰撞快速召回候选集
+#[derive(Debug)]
+pub struct NativeConsciousnessIndex {
+    dim: usize,
+    n_tables: usize,
+    n_bits: usize,
+    seed: u64,
+    hyperplanes: Vec<Vec<Vec<Float>>>,
+    tables: Vec<HashMap<u64, Vec<u64>>>,
+    vectors: HashMap<u64, Vec<Float>>,
+    id_map: IdMap,
+    tombstones: HashSet<u64>,
+    audit: AuditLog,
+}
+
+impl NativeConsciousnessIndex {
+    pub fn new(dim: usize, n_tables: usize, n_bits: usize, seed: u64) -> Self {
+        let mut rng = create_seeded_rng(seed);
+        let hyperplanes: Vec<Vec<Vec<Float>>> = (0..n_tables)
+            .map(|_| {
+                (0..n_bits)
+                    .map(|_| {
+                        (0..dim)
+                            .map(|_| rng.random::<Float>() * 2.0 - 1.0)
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect();
+        let tables: Vec<HashMap<u64, Vec<u64>>> = (0..n_tables).map(|_| HashMap::new()).collect();
+        Self { dim, n_tables, n_bits, seed, hyperplanes, tables, vectors: HashMap::new(),
+            id_map: IdMap::new(), tombstones: HashSet::new(), audit: AuditLog::new() }
+    }
+
+    fn hash_vec(&self, table: usize, vec: &[Float]) -> u64 {
+        let mut h: u64 = 0;
+        for (bit_idx, plane) in self.hyperplanes[table].iter().enumerate() {
+            let dot: Float = vec.iter().zip(plane.iter()).map(|(a, b)| a * b).sum();
+            if dot >= 0.0 { h |= 1u64 << bit_idx; }
+        }
+        h
+    }
+
+    fn probe_buckets(&self, table: usize, hash: u64) -> Vec<u64> {
+        let mut buckets = vec![hash];
+        for bit in 0..self.n_bits.min(8) { buckets.push(hash ^ (1u64 << bit)); }
+        buckets
+    }
+
+    fn to_snapshot(&self) -> LshSnapshot {
+        LshSnapshot { dim: self.dim, n_tables: self.n_tables, n_bits: self.n_bits, seed: self.seed,
+            hyperplanes: self.hyperplanes.clone(), tables: self.tables.clone(), vectors: self.vectors.clone(),
+            id_map_fwd: self.id_map.all_ids().into_iter().collect(), tombstones: self.tombstones.iter().copied().collect() }
+    }
+
+    fn from_snapshot(snap: LshSnapshot) -> Self {
+        let mut id_map = IdMap::new();
+        let mut mapping: HashMap<u64, u64> = HashMap::new();
+        for (s, old_n) in &snap.id_map_fwd {
+            let new_n = id_map.insert(s.clone()).unwrap_or_else(|_| id_map.get_num(s).unwrap_or(0));
+            mapping.insert(*old_n, new_n);
+        }
+        let mut vectors = HashMap::new();
+        for (old_n, v) in &snap.vectors {
+            if let Some(&new_n) = mapping.get(old_n) { vectors.insert(new_n, v.clone()); }
+        }
+        let tables: Vec<HashMap<u64, Vec<u64>>> = snap.tables.iter().map(|t| {
+            let mut new_t = HashMap::new();
+            for (hash, ids) in t {
+                let new_ids: Vec<u64> = ids.iter().filter_map(|old| mapping.get(old).copied()).collect();
+                if !new_ids.is_empty() { new_t.insert(*hash, new_ids); }
+            }
+            new_t
+        }).collect();
+        let tombstones: HashSet<u64> = snap.tombstones.iter().filter_map(|old| mapping.get(old).copied()).collect();
+        Self { dim: snap.dim, n_tables: snap.n_tables, n_bits: snap.n_bits, seed: snap.seed,
+            hyperplanes: snap.hyperplanes, tables, vectors, id_map, tombstones, audit: AuditLog::new() }
+    }
+
+    pub fn add_mut(&mut self, id: &str, vec: &[Float]) -> Result<()> {
+        if vec.len() != self.dim {
+            return Err(LingShuError::DimensionMismatch { expected: self.dim, got: vec.len() });
+        }
+        if self.id_map.contains(id) {
+            return Err(LingShuError::InvalidParameter(format!("duplicate id: {id}")));
+        }
+        let nid = self.id_map.insert(id.to_string())?;
+        self.vectors.insert(nid, vec.to_vec());
+        for t in 0..self.n_tables {
+            let h = self.hash_vec(t, vec);
+            self.tables[t].entry(h).or_default().push(nid);
+        }
+        self.audit.record(AuditOp::Add { id: id.to_string(), dim: self.dim }, &format!("id={id}, nid={nid}"), Some(self.seed));
+        Ok(())
+    }
+
+    pub fn remove_mut(&mut self, id: &str) -> Result<()> {
+        let nid = self.id_map.get_num(id).ok_or(LingShuError::NotFound)?;
+        self.tombstones.insert(nid);
+        self.audit.record(AuditOp::Remove { id: id.to_string() }, &format!("id={id}, nid={nid}, tombstone"), None);
+        Ok(())
+    }
+
+    pub fn audit_log(&self) -> &AuditLog { &self.audit }
+
+    pub fn compact_mut(&mut self) -> Result<usize> {
+        let removed = self.tombstones.len();
+        for nid in self.tombstones.drain() {
+            self.vectors.remove(&nid);
+            for t in &mut self.tables {
+                for ids in t.values_mut() { ids.retain(|&id| id != nid); }
+            }
+        }
+        for t in &mut self.tables { t.retain(|_, ids| !ids.is_empty()); }
+        self.id_map.compact();
+        self.audit.record(AuditOp::Compact { removed_count: removed }, &format!("removed={removed}"), None);
+        Ok(removed)
+    }
+}
+
+impl ConsciousnessIndex for NativeConsciousnessIndex {
+    fn name(&self) -> &str { "native_lsh" }
+    fn dimension(&self) -> usize { self.dim }
+
+    fn add(&self, _id: &str, _vec: &[Float]) -> Result<()> {
+        Err(LingShuError::InvalidParameter("Use add_mut or wrap in ThreadSafeLshIndex".into()))
+    }
+    fn remove(&self, _id: &str) -> Result<()> {
+        Err(LingShuError::InvalidParameter("Use remove_mut or wrap in ThreadSafeLshIndex".into()))
+    }
+
+    fn query(&self, vec: &[Float], k: usize) -> Result<Vec<QueryResult>> {
+        if vec.len() != self.dim {
+            return Err(LingShuError::DimensionMismatch { expected: self.dim, got: vec.len() });
+        }
+        let mut candidates: HashSet<u64> = HashSet::new();
+        for t in 0..self.n_tables {
+            let h = self.hash_vec(t, vec);
+            for bucket in self.probe_buckets(t, h) {
+                if let Some(ids) = self.tables[t].get(&bucket) {
+                    for &nid in ids { if !self.tombstones.contains(&nid) { candidates.insert(nid); } }
+                }
+            }
+        }
+        let mut results: Vec<QueryResult> = candidates.into_iter().filter_map(|nid| {
+            let stored = self.vectors.get(&nid)?;
+            let sid = self.id_map.get_str(nid)?;
+            let dist: Float = stored.iter().zip(vec.iter()).map(|(a, b)| (a - b) * (a - b)).sum();
+            Some(QueryResult { id: sid.to_string(), distance: dist, score: 1.0 / (1.0 + dist) })
+        }).collect();
+        results.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+        results.truncate(k);
+        Ok(results)
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        if let Some(nid) = self.id_map.get_num(id) { !self.tombstones.contains(&nid) } else { false }
+    }
+    fn len(&self) -> usize { self.vectors.len() - self.tombstones.len() }
+
+    fn persist(&self, path: &Path) -> Result<()> {
+        let snap = self.to_snapshot();
+        let header = PersistenceHeader::new("native_lsh", self.dim, self.len());
+        save_to_file(path, &header, &snap)?;
+        // self.audit.record(AuditOp::Persist { path: path.display().to_string() }, &format!("path={}", path.display()), None);  // &self 无法 mut borrow，已注释
+        Ok(())
+    }
+
+    fn load(&mut self, path: &Path) -> Result<()> {
+        let (_header, snap): (PersistenceHeader, LshSnapshot) = load_from_file(path, "native_lsh")?;
+        let restored = Self::from_snapshot(snap);
+        self.dim = restored.dim; self.n_tables = restored.n_tables; self.n_bits = restored.n_bits;
+        self.seed = restored.seed; self.hyperplanes = restored.hyperplanes; self.tables = restored.tables;
+        self.vectors = restored.vectors; self.id_map = restored.id_map; self.tombstones = restored.tombstones;
+        self.audit.record(AuditOp::Load { path: path.display().to_string() }, &format!("path={}", path.display()), None);
+        Ok(())
+    }
+
+    fn compact(&self) -> Result<usize> {
+        Err(LingShuError::InvalidParameter("Use compact_mut or wrap in ThreadSafeLshIndex".into()))
+    }
+    fn needs_training(&self) -> bool { false }
+    fn train(&self, _data: &[Float], _params: &TrainParams) -> Result<()> { Ok(()) }
+    fn is_trained(&self) -> bool { true }
+    fn audit_log(&self) -> Option<&AuditLog> { Some(&self.audit) }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ThreadSafe LSH 包装器
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct ThreadSafeLshIndex {
+    inner: RwLock<NativeConsciousnessIndex>,
+}
+
+impl Debug for ThreadSafeLshIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThreadSafeLshIndex").field("dim", &self.inner.read().map(|g| g.dimension()).unwrap_or(0)).finish()
+    }
+}
+
+impl ThreadSafeLshIndex {
+    pub fn new(dim: usize, n_tables: usize, n_bits: usize, seed: u64) -> Self {
+        Self { inner: RwLock::new(NativeConsciousnessIndex::new(dim, n_tables, n_bits, seed)) }
+    }
+    pub fn add(&self, id: &str, vec: &[Float]) -> Result<()> {
+        self.inner.write().map_err(|_| LingShuError::BackendError("RwLock poisoned".into()))?.add_mut(id, vec)
+    }
+    pub fn remove(&self, id: &str) -> Result<()> {
+        self.inner.write().map_err(|_| LingShuError::BackendError("RwLock poisoned".into()))?.remove_mut(id)
+    }
+    pub fn query(&self, vec: &[Float], k: usize) -> Result<Vec<QueryResult>> {
+        self.inner.read().map_err(|_| LingShuError::BackendError("RwLock poisoned".into()))?.query(vec, k)
+    }
+    pub fn contains(&self, id: &str) -> bool {
+        self.inner.read().map(|g| g.contains(id)).unwrap_or(false)
+    }
+    pub fn persist(&self, path: &Path) -> Result<()> {
+        self.inner.read().map_err(|_| LingShuError::BackendError("RwLock poisoned".into()))?.persist(path)
+    }
+    pub fn load(&self, path: &Path) -> Result<()> {
+        self.inner.write().map_err(|_| LingShuError::BackendError("RwLock poisoned".into()))?.load(path)
+    }
+    pub fn compact(&self) -> Result<usize> {
+        self.inner.write().map_err(|_| LingShuError::BackendError("RwLock poisoned".into()))?.compact_mut()
+    }
+    pub fn len(&self) -> usize { self.inner.read().map(|g| g.len()).unwrap_or(0) }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+}
+
+// 为ThreadSafeLshIndex实现ConsciousnessIndex（通过内部可变性桥接）
+impl ConsciousnessIndex for ThreadSafeLshIndex {
+    fn name(&self) -> &str { "native_lsh_threadsafe" }
+    fn dimension(&self) -> usize { self.inner.read().map(|g| g.dimension()).unwrap_or(0) }
+    fn add(&self, id: &str, vector: &[Float]) -> Result<()> { self.add(id, vector) }
+    fn remove(&self, id: &str) -> Result<()> { self.remove(id) }
+    fn query(&self, vector: &[Float], k: usize) -> Result<Vec<QueryResult>> { self.query(vector, k) }
+    fn contains(&self, id: &str) -> bool { self.contains(id) }
+    fn persist(&self, path: &Path) -> Result<()> { self.persist(path) }
+    fn load(&mut self, path: &Path) -> Result<()> { self.inner.write().map_err(|_| LingShuError::BackendError("RwLock poisoned".into()))?.load(path) }
+    fn compact(&self) -> Result<usize> { self.compact() }
+    fn len(&self) -> usize { self.len() }
+    fn needs_training(&self) -> bool { false }
+    fn train(&self, _data: &[Float], _params: &TrainParams) -> Result<()> { Ok(()) }
+    fn is_trained(&self) -> bool { true }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PART 3: HNSW索引（ling-shu-core版）+ IVF索引 + 工厂函数 + 量化器 + Prometheus
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第28层：HnswIndex（ling-shu-core版，HnswNode + DistNode + ThreadSafeHnswIndex）
+// 替代文件2的hnsw模块，成为>=1K数据规模的推荐索引
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Serialize, Deserialize)]
+struct HnswSnapshot {
+    dim: usize,
+    max_elements: usize,
+    m: usize,
+    ef_construction: usize,
+    ef: usize,
+    seed: u64,
+    level_mult: Float,
+    ids: Vec<(String, u64)>,
+    vectors: Vec<(u64, Vec<Float>)>,
+    neighbors: Vec<(u64, Vec<Vec<u64>>)>,
+    enter_points: Vec<u64>,
+    tombstones: Vec<u64>,
+}
+
+/// HNSW图节点
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HnswNode {
+    #[serde(skip)]
+    id: u64,
+    level: usize,
+    neighbors: Vec<Vec<u64>>,
+    vector: Vec<Float>,
+}
+
+impl HnswNode {
+    fn new(id: u64, level: usize, vector: Vec<Float>) -> Self {
+        let mut neighbors = Vec::with_capacity(level + 1);
+        for _ in 0..=level { neighbors.push(Vec::new()); }
+        Self { id, level, neighbors, vector }
+    }
+}
+
+/// 距离节点（用于优先队列）
+#[derive(Debug, Clone)]
+struct DistNode {
+    dist: Float,
+    node_id: u64,
+}
+
+impl PartialEq for DistNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.dist == other.dist && self.node_id == other.node_id
+    }
+}
+impl Eq for DistNode {}
+impl PartialOrd for DistNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for DistNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.dist.partial_cmp(&other.dist).unwrap_or(Ordering::Equal).reverse()
+    }
+}
+
+/// HNSW（Hierarchical Navigable Small World）近似最近邻索引
+/// 适合>=1K数据规模，高召回率的图索引
+#[derive(Debug)]
+pub struct HnswIndex {
+    dim: usize,
+    max_elements: usize,
+    m: usize,
+    ef_construction: usize,
+    ef: usize,
+    seed: u64,
+    level_mult: Float,
+    nodes: HashMap<u64, HnswNode>,
+    id_map: IdMap,
+    enter_points: Vec<u64>,
+    tombstones: HashSet<u64>,
+    audit: AuditLog,
+}
+
+impl HnswIndex {
+    pub fn new(dim: usize, max_elements: usize, m: usize, ef_construction: usize, ef: usize, seed: u64) -> Self {
+        Self { dim, max_elements, m, ef_construction, ef, seed, level_mult: 1.0 / (m as Float).ln(),
+            nodes: HashMap::new(), id_map: IdMap::new(), enter_points: Vec::new(), tombstones: HashSet::new(),
+            audit: AuditLog::new() }
+    }
+
+    fn l2_dist(&self, a: &[Float], b: &[Float]) -> Float {
+        a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum::<Float>()
+    }
+
+    fn random_level(&self) -> usize {
+        let mut rng = create_seeded_rng(self.seed);
+        let mut level = 0usize;
+        while rng.random::<Float>() < self.level_mult && level < 16 { level += 1; }
+        level
+    }
+
+    fn search_layer(&self, query: &[Float], ep: u64, ef: usize, layer: usize) -> BinaryHeap<DistNode> {
+        let mut visited: HashSet<u64> = HashSet::new();
+        let mut candidates: BinaryHeap<DistNode> = BinaryHeap::new();
+        let mut results: BinaryHeap<DistNode> = BinaryHeap::new();
+        if let Some(node) = self.nodes.get(&ep) {
+            let d = self.l2_dist(query, &node.vector);
+            candidates.push(DistNode { dist: d, node_id: ep });
+            results.push(DistNode { dist: d, node_id: ep });
+            visited.insert(ep);
+        }
+        while let Some(curr) = candidates.pop() {
+            if let Some(curr_node) = self.nodes.get(&curr.node_id) {
+                if curr.dist > results.peek().map_or(Float::INFINITY, |r| r.dist) {
+                    if results.len() >= ef { break; }
+                }
+                for &nid in &curr_node.neighbors[layer] {
+                    if visited.insert(nid) {
+                        if let Some(n) = self.nodes.get(&nid) {
+                            if !self.tombstones.contains(&nid) {
+                                let d = self.l2_dist(query, &n.vector);
+                                if results.len() < ef {
+                                    candidates.push(DistNode { dist: d, node_id: nid });
+                                    results.push(DistNode { dist: d, node_id: nid });
+                                } else if d < results.peek().unwrap().dist {
+                                    candidates.push(DistNode { dist: d, node_id: nid });
+                                    results.pop();
+                                    results.push(DistNode { dist: d, node_id: nid });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        results
+    }
+
+    pub fn add_mut(&mut self, id: &str, vec: &[Float]) -> Result<()> {
+        if vec.len() != self.dim {
+            return Err(LingShuError::DimensionMismatch { expected: self.dim, got: vec.len() });
+        }
+        if self.id_map.contains(id) {
+            return Err(LingShuError::InvalidParameter(format!("duplicate id: {id}")));
+        }
+        if self.nodes.len() >= self.max_elements {
+            return Err(LingShuError::InvalidParameter("HNSW index full".into()));
+        }
+        let nid = self.id_map.insert(id.to_string())?;
+        let level = self.random_level();
+        let node = HnswNode::new(nid, level, vec.to_vec());
+        let is_first = self.nodes.is_empty();
+        self.nodes.insert(nid, node.clone());
+        if is_first {
+            self.enter_points = vec![nid];
+        } else {
+            let ep = self.enter_points.last().copied().unwrap_or(nid);
+            let mut curr = ep;
+            for l in (level + 1..self.enter_points.len()).rev() {
+                let res = self.search_layer(vec, curr, 1, l);
+                if let Some(best) = res.peek() { curr = best.node_id; }
+            }
+            let max_neighbors = self.m;
+            for l in 0..=level {
+                let res = self.search_layer(vec, curr, self.ef_construction, l);
+                let neighbors: Vec<u64> = res.into_sorted_vec().into_iter().map(|dn| dn.node_id)
+                    .filter(|&id| id != nid).take(max_neighbors).collect();
+                if let Some(n) = self.nodes.get_mut(&nid) {
+                    if l < n.neighbors.len() { n.neighbors[l] = neighbors.clone(); }
+                }
+                for &n_id in &neighbors {
+                    if let Some(n) = self.nodes.get_mut(&n_id) {
+                        if l < n.neighbors.len() { n.neighbors[l].push(nid); }
+                    }
+                }
+                if let Some(best) = self.search_layer(vec, curr, 1, l).peek() { curr = best.node_id; }
+            }
+            if level >= self.enter_points.len() {
+                self.enter_points.push(nid);
+            }
+        }
+        self.audit.record(AuditOp::Add { id: id.to_string(), dim: self.dim }, &format!("id={id}, nid={nid}, level={level}"), Some(self.seed));
+        Ok(())
+    }
+
+    pub fn query_mut(&self, vec: &[Float], k: usize) -> Result<Vec<QueryResult>> {
+        if vec.len() != self.dim {
+            return Err(LingShuError::DimensionMismatch { expected: self.dim, got: vec.len() });
+        }
+        if self.nodes.is_empty() { return Ok(Vec::new()); }
+        let ep = self.enter_points.last().copied().unwrap();
+        let mut curr = ep;
+        for l in (0..self.enter_points.len()).rev() {
+            let res = self.search_layer(vec, curr, 1, l);
+            if let Some(best) = res.peek() { curr = best.node_id; }
+        }
+        let results = self.search_layer(vec, curr, self.ef, 0);
+        let mut out: Vec<QueryResult> = results.into_sorted_vec().into_iter().filter(|dn| !self.tombstones.contains(&dn.node_id))
+            .filter_map(|dn| {
+                self.id_map.get_str(dn.node_id).map(|sid| QueryResult {
+                    id: sid.to_string(), distance: dn.dist, score: 1.0 / (1.0 + dn.dist),
+                })
+            }).take(k).collect();
+        out.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
+        Ok(out)
+    }
+
+    pub fn remove_mut(&mut self, id: &str) -> Result<()> {
+        let nid = self.id_map.get_num(id).ok_or(LingShuError::NotFound)?;
+        self.tombstones.insert(nid);
+        self.audit.record(AuditOp::Remove { id: id.to_string() }, &format!("id={id}, nid={nid}, tombstone"), None);
+        Ok(())
+    }
+
+    pub fn compact_mut(&mut self) -> Result<usize> {
+        let removed = self.tombstones.len();
+        for nid in self.tombstones.drain() {
+            self.nodes.remove(&nid);
+            for node in self.nodes.values_mut() {
+                for level in &mut node.neighbors { level.retain(|&id| id != nid); }
+            }
+        }
+        self.enter_points.retain(|&ep| self.nodes.contains_key(&ep));
+        self.id_map.compact();
+        self.audit.record(AuditOp::Compact { removed_count: removed }, &format!("removed={removed}"), None);
+        Ok(removed)
+    }
+
+    fn to_snapshot(&self) -> HnswSnapshot {
+        HnswSnapshot { dim: self.dim, max_elements: self.max_elements, m: self.m,
+            ef_construction: self.ef_construction, ef: self.ef, seed: self.seed,
+            level_mult: self.level_mult, ids: self.id_map.all_ids(),
+            vectors: self.nodes.iter().map(|(&k, v)| (k, v.vector.clone())).collect(),
+            neighbors: self.nodes.iter().map(|(&k, v)| (k, v.neighbors.clone())).collect(),
+            enter_points: self.enter_points.clone(), tombstones: self.tombstones.iter().copied().collect() }
+    }
+
+    fn from_snapshot(snap: HnswSnapshot) -> Result<Self> {
+        let mut id_map = IdMap::new();
+        let mut mapping: HashMap<u64, u64> = HashMap::new();
+        for (s, old_n) in &snap.ids {
+            let new_n = id_map.insert(s.clone()).unwrap_or_else(|_| id_map.get_num(s).unwrap_or(0));
+            mapping.insert(*old_n, new_n);
+        }
+        let mut nodes = HashMap::new();
+        for (old_id, vector) in &snap.vectors {
+            if let Some(&new_id) = mapping.get(old_id) {
+                let old_neighbors: Vec<Vec<u64>> = snap.neighbors.iter()
+                    .find(|(id, _)| id == old_id).map(|(_, n)| n.clone()).unwrap_or_default();
+                let new_neighbors: Vec<Vec<u64>> = old_neighbors.iter().map(|level| {
+                    level.iter().filter_map(|old_nid| mapping.get(old_nid).copied()).collect()
+                }).collect();
+                let level = new_neighbors.len().saturating_sub(1);
+                let mut node = HnswNode::new(new_id, level, vector.clone());
+                node.neighbors = new_neighbors;
+                nodes.insert(new_id, node);
+            }
+        }
+        let enter_points: Vec<u64> = snap.enter_points.iter().filter_map(|ep| mapping.get(ep).copied()).collect();
+        let tombstones: HashSet<u64> = snap.tombstones.iter().filter_map(|t| mapping.get(t).copied()).collect();
+        Ok(Self { dim: snap.dim, max_elements: snap.max_elements, m: snap.m,
+            ef_construction: snap.ef_construction, ef: snap.ef, seed: snap.seed,
+            level_mult: snap.level_mult, nodes, id_map, enter_points, tombstones,
+            audit: AuditLog::new() })
+    }
+
+    pub fn persist_mut(&self, path: &Path) -> Result<()> {
+        let snap = self.to_snapshot();
+        let header = PersistenceHeader::new("hnsw", self.dim, self.len());
+        save_to_file(path, &header, &snap)?;
+        // self.audit.record(AuditOp::Persist { path: path.display().to_string() }, &format!("path={}", path.display()), Some(self.seed));  // &self 无法 mut borrow，已注释
+        Ok(())
+    }
+
+    pub fn load_mut(&mut self, path: &Path) -> Result<()> {
+        let (_header, snap): (PersistenceHeader, HnswSnapshot) = load_from_file(path, "hnsw")?;
+        let restored = Self::from_snapshot(snap)?;
+        self.dim = restored.dim; self.max_elements = restored.max_elements;
+        self.m = restored.m; self.ef_construction = restored.ef_construction;
+        self.ef = restored.ef; self.seed = restored.seed; self.level_mult = restored.level_mult;
+        self.nodes = restored.nodes; self.id_map = restored.id_map;
+        self.enter_points = restored.enter_points; self.tombstones = restored.tombstones;
+        self.audit.record(AuditOp::Load { path: path.display().to_string() }, &format!("path={}", path.display()), Some(self.seed));
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize { self.nodes.len() - self.tombstones.len() }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ThreadSafe HNSW 包装器
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct ThreadSafeHnswIndex {
+    inner: RwLock<HnswIndex>,
+}
+
+impl Debug for ThreadSafeHnswIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThreadSafeHnswIndex").field("dim", &self.inner.read().map(|g| g.dim).unwrap_or(0)).finish()
+    }
+}
+
+impl ThreadSafeHnswIndex {
+    pub fn new(dim: usize, max_elements: usize, m: usize, ef_construction: usize, ef: usize, seed: u64) -> Self {
+        Self { inner: RwLock::new(HnswIndex::new(dim, max_elements, m, ef_construction, ef, seed)) }
+    }
+    pub fn add(&self, id: &str, vec: &[Float]) -> Result<()> {
+        self.inner.write().map_err(|_| LingShuError::BackendError("RwLock poisoned".into()))?.add_mut(id, vec)
+    }
+    pub fn remove(&self, id: &str) -> Result<()> {
+        self.inner.write().map_err(|_| LingShuError::BackendError("RwLock poisoned".into()))?.remove_mut(id)
+    }
+    pub fn query(&self, vec: &[Float], k: usize) -> Result<Vec<QueryResult>> {
+        self.inner.read().map_err(|_| LingShuError::BackendError("RwLock poisoned".into()))?.query_mut(vec, k)
+    }
+    pub fn contains(&self, id: &str) -> bool {
+        self.inner.read().map(|g| g.id_map.contains(id) && {
+            g.id_map.get_num(id).map_or(false, |nid| !g.tombstones.contains(&nid))
+        }).unwrap_or(false)
+    }
+    pub fn persist(&self, path: &Path) -> Result<()> {
+        self.inner.read().map_err(|_| LingShuError::BackendError("RwLock poisoned".into()))?.persist_mut(path)
+    }
+    pub fn load(&self, path: &Path) -> Result<()> {
+        self.inner.write().map_err(|_| LingShuError::BackendError("RwLock poisoned".into()))?.load_mut(path)
+    }
+    pub fn compact(&self) -> Result<usize> {
+        self.inner.write().map_err(|_| LingShuError::BackendError("RwLock poisoned".into()))?.compact_mut()
+    }
+    pub fn len(&self) -> usize { self.inner.read().map(|g| g.len()).unwrap_or(0) }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+}
+
+impl ConsciousnessIndex for ThreadSafeHnswIndex {
+    fn name(&self) -> &str { "hnsw_threadsafe" }
+    fn dimension(&self) -> usize { self.inner.read().map(|g| g.dim).unwrap_or(0) }
+    fn add(&self, id: &str, vector: &[Float]) -> Result<()> { self.add(id, vector) }
+    fn remove(&self, id: &str) -> Result<()> { self.remove(id) }
+    fn query(&self, vector: &[Float], k: usize) -> Result<Vec<QueryResult>> { self.query(vector, k) }
+    fn contains(&self, id: &str) -> bool { self.contains(id) }
+    fn persist(&self, path: &Path) -> Result<()> { self.persist(path) }
+    fn load(&mut self, path: &Path) -> Result<()> { self.inner.write().map_err(|_| LingShuError::BackendError("RwLock poisoned".into()))?.load_mut(path) }
+    fn compact(&self) -> Result<usize> { self.compact() }
+    fn len(&self) -> usize { self.len() }
+    fn needs_training(&self) -> bool { false }
+    fn train(&self, _data: &[Float], _params: &TrainParams) -> Result<()> { Ok(()) }
+    fn is_trained(&self) -> bool { true }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第29层：K-Means聚类辅助函数（用于IVF索引训练）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 标准K-Means聚类（Lloyd算法），用于IVF索引的倒排文件划分
+pub fn kmeans(data: &[Float], dim: usize, n_clusters: usize, n_iterations: usize, seed: u64, tolerance: Float) -> (Vec<Float>, Vec<usize>) {
+    let n = data.len() / dim;
+    if n == 0 || n_clusters == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let n_clusters = n_clusters.min(n);
+    let mut rng = create_seeded_rng(seed);
+    let mut centroids: Vec<Float> = Vec::with_capacity(n_clusters * dim);
+    let mut indices: Vec<usize> = (0..n).collect();
+    for i in 0..indices.len() { let j = rng.random_range(0..=i); indices.swap(i, j); }
+    for ci in 0..n_clusters {
+        let src = indices[ci] * dim;
+        centroids.extend_from_slice(&data[src..src + dim]);
+    }
+    let mut assignments: Vec<usize> = vec![0; n];
+    for _iter in 0..n_iterations {
+        let mut new_assignments = vec![0usize; n];
+        let mut changed = false;
+        for i in 0..n {
+            let best: (usize, Float) = (0..n_clusters).map(|ci| {
+                let mut dist: Float = 0.0;
+                for d in 0..dim {
+                    let diff = data[i * dim + d] - centroids[ci * dim + d];
+                    dist += diff * diff;
+                }
+                (ci, dist)
+            }).min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap_or((0, 0.0));
+            new_assignments[i] = best.0;
+            if new_assignments[i] != assignments[i] { changed = true; }
+        }
+        assignments = new_assignments;
+        if !changed { break; }
+        for ci in 0..n_clusters {
+            let mut new_cent = vec![0.0f64; dim];
+            let mut count = 0usize;
+            for i in 0..n {
+                if assignments[i] == ci {
+                    for d in 0..dim { new_cent[d] += data[i * dim + d] as f64; }
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                for d in 0..dim { centroids[ci * dim + d] = (new_cent[d] / count as f64) as Float; }
+            }
+        }
+    }
+    (centroids, assignments)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第30层：FaissConsciousnessIndex — IVF-PQ近似索引（从ling-shu-core引入）
+// 训练型索引，适合大数据量场景（>10K），需要显式训练步骤
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Serialize, Deserialize)]
+struct FaissSnapshot {
+    dim: usize,
+    nlist: usize,
+    nprobe: usize,
+    seed: u64,
+    centroids: Vec<Float>,
+    inverted_lists: Vec<Vec<(u64, Vec<Float>)>>,
+    id_map_fwd: Vec<(String, u64)>,
+    assignments: Vec<usize>,
+    trained: bool,
+}
+
+/// IVF-PQ风格的倒排文件索引（纯Rust实现，无FAISS依赖）
+/// 训练阶段：KMeans聚类生成质心
+/// 查询阶段：先找最近的nprobe个质心，再在这些桶内精确搜索
+#[derive(Debug)]
+pub struct FaissConsciousnessIndex {
+    dim: usize,
+    nlist: usize,
+    nprobe: usize,
+    seed: u64,
+    trained: bool,
+    centroids: Vec<Float>,
+    inverted_lists: Vec<Vec<(u64, Vec<Float>)>>,
+    id_map: IdMap,
+    tombstones: HashSet<u64>,
+    audit: AuditLog,
+}
+
+impl FaissConsciousnessIndex {
+    pub fn new(dim: usize, nlist: usize, nprobe: usize, seed: u64) -> Self {
+        Self { dim, nlist, nprobe, seed, trained: false, centroids: Vec::new(),
+            inverted_lists: Vec::new(), id_map: IdMap::new(), tombstones: HashSet::new(),
+            audit: AuditLog::new() }
+    }
+
+    /// 是否需要训练（IVF索引必须先训练才能使用）
+    pub fn needs_training(&self) -> bool {
+        true
+    }
+
+    /// 是否已完成训练
+    pub fn is_trained(&self) -> bool {
+        self.trained
+    }
+
+    fn l2_dist(&self, a: &[Float], b: &[Float]) -> Float {
+        a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum::<Float>()
+    }
+
+    pub fn train_mut(&mut self, data: &[Float], params: &TrainParams) -> Result<()> {
+        if data.len() % self.dim != 0 {
+            return Err(LingShuError::InvalidParameter("training data length not multiple of dimension".into()));
+        }
+        let n_vectors = data.len() / self.dim;
+        if n_vectors < self.nlist {
+            return Err(LingShuError::InvalidParameter(format!("need at least {} vectors, got {}", self.nlist, n_vectors)));
+        }
+        let effective_nlist = self.nlist.min(n_vectors);
+        let (centroids, assignments) = kmeans(data, self.dim, effective_nlist, params.n_iterations, self.seed, params.tolerance);
+        self.centroids = centroids;
+        self.inverted_lists = vec![Vec::new(); effective_nlist];
+        for i in 0..n_vectors {
+            let ci = assignments[i];
+            let v: Vec<Float> = data[i * self.dim..(i + 1) * self.dim].to_vec();
+            self.inverted_lists[ci].push((i as u64, v));
+        }
+        self.trained = true;
+        self.audit.record(
+            AuditOp::Train { n_vectors, params: format!("nlist={effective_nlist}, nprobe={}", self.nprobe), seed: self.seed },
+            &format!("trained with {n_vectors} vectors, {effective_nlist} clusters"), Some(self.seed)
+        );
+        Ok(())
+    }
+
+    pub fn add_mut(&mut self, id: &str, vec: &[Float]) -> Result<()> {
+        if !self.trained {
+            return Err(LingShuError::InvalidParameter("IVF index must be trained before add".into()));
+        }
+        if vec.len() != self.dim {
+            return Err(LingShuError::DimensionMismatch { expected: self.dim, got: vec.len() });
+        }
+        if self.id_map.contains(id) {
+            return Err(LingShuError::InvalidParameter(format!("duplicate id: {id}")));
+        }
+        let nid = self.id_map.insert(id.to_string())?;
+        let best_ci = (0..self.centroids.len() / self.dim)
+            .map(|ci| (ci, self.l2_dist(vec, &self.centroids[ci * self.dim..(ci + 1) * self.dim])))
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).map(|(ci, _)| ci)
+            .unwrap_or(0);
+        if best_ci < self.inverted_lists.len() {
+            self.inverted_lists[best_ci].push((nid, vec.to_vec()));
+        }
+        self.audit.record(AuditOp::Add { id: id.to_string(), dim: self.dim }, &format!("id={id}, nid={nid}, bucket={best_ci}"), Some(self.seed));
+        Ok(())
+    }
+
+    pub fn remove_mut(&mut self, id: &str) -> Result<()> {
+        let nid = self.id_map.get_num(id).ok_or(LingShuError::NotFound)?;
+        self.tombstones.insert(nid);
+        self.audit.record(AuditOp::Remove { id: id.to_string() }, &format!("id={id}, nid={nid}, tombstone"), None);
+        Ok(())
+    }
+
+    pub fn query_mut(&self, vec: &[Float], k: usize) -> Result<Vec<QueryResult>> {
+        if !self.trained { return Ok(Vec::new()); }
+        if vec.len() != self.dim {
+            return Err(LingShuError::DimensionMismatch { expected: self.dim, got: vec.len() });
+        }
+        let n_centroids = self.centroids.len() / self.dim;
+        let mut centroid_dists: Vec<(usize, Float)> = (0..n_centroids)
+            .map(|ci| (ci, self.l2_dist(vec, &self.centroids[ci * self.dim..(ci + 1) * self.dim])))
+            .collect();
+        centroid_dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        let probe_ci: Vec<usize> = centroid_dists.into_iter().take(self.nprobe).map(|(ci, _)| ci).collect();
+        let mut results: Vec<QueryResult> = Vec::new();
+        for ci in probe_ci {
+            if ci < self.inverted_lists.len() {
+                for &(nid, ref stored) in &self.inverted_lists[ci] {
+                    if !self.tombstones.contains(&nid) {
+                        if let Some(sid) = self.id_map.get_str(nid) {
+                            let dist = self.l2_dist(vec, stored);
+                            results.push(QueryResult { id: sid.to_string(), distance: dist, score: 1.0 / (1.0 + dist) });
+                        }
+                    }
+                }
+            }
+        }
+        results.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
+        results.truncate(k);
+        Ok(results)
+    }
+
+    pub fn compact_mut(&mut self) -> Result<usize> {
+        let removed = self.tombstones.len();
+        for ci in &mut self.inverted_lists {
+            ci.retain(|(nid, _)| !self.tombstones.contains(nid));
+        }
+        self.tombstones.clear();
+        self.id_map.compact();
+        self.audit.record(AuditOp::Compact { removed_count: removed }, &format!("removed={removed}"), None);
+        Ok(removed)
+    }
+
+    fn to_snapshot(&self) -> FaissSnapshot {
+        FaissSnapshot { dim: self.dim, nlist: self.nlist, nprobe: self.nprobe, seed: self.seed,
+            centroids: self.centroids.clone(), inverted_lists: self.inverted_lists.clone(),
+            id_map_fwd: self.id_map.all_ids(), assignments: Vec::new(), trained: self.trained }
+    }
+
+    fn from_snapshot(snap: FaissSnapshot) -> Result<Self> {
+        let mut id_map = IdMap::new();
+        let mut mapping: HashMap<u64, u64> = HashMap::new();
+        for (s, old_n) in &snap.id_map_fwd {
+            let new_n = id_map.insert(s.clone()).unwrap_or_else(|_| id_map.get_num(s).unwrap_or(0));
+            mapping.insert(*old_n, new_n);
+        }
+        let inverted_lists: Vec<Vec<(u64, Vec<Float>)>> = snap.inverted_lists.iter().map(|list| {
+            list.iter().filter_map(|(old_nid, v)| {
+                mapping.get(old_nid).map(|&new_nid| (new_nid, v.clone()))
+            }).collect()
+        }).collect();
+        Ok(Self { dim: snap.dim, nlist: snap.nlist, nprobe: snap.nprobe, seed: snap.seed,
+            trained: snap.trained, centroids: snap.centroids, inverted_lists, id_map,
+            tombstones: HashSet::new(), audit: AuditLog::new() })
+    }
+
+    pub fn persist_mut(&self, path: &Path) -> Result<()> {
+        let snap = self.to_snapshot();
+        let header = PersistenceHeader::new("faiss_ivf", self.dim, self.len());
+        save_to_file(path, &header, &snap)?;
+        // self.audit.record(AuditOp::Persist { path: path.display().to_string() }, &format!("path={}", path.display()), Some(self.seed));  // &self 无法 mut borrow，已注释
+        Ok(())
+    }
+
+    pub fn load_mut(&mut self, path: &Path) -> Result<()> {
+        let (_header, snap): (PersistenceHeader, FaissSnapshot) = load_from_file(path, "faiss_ivf")?;
+        let restored = Self::from_snapshot(snap)?;
+        self.dim = restored.dim; self.nlist = restored.nlist; self.nprobe = restored.nprobe;
+        self.seed = restored.seed; self.trained = restored.trained;
+        self.centroids = restored.centroids; self.inverted_lists = restored.inverted_lists;
+        self.id_map = restored.id_map; self.tombstones = restored.tombstones;
+        self.audit.record(AuditOp::Load { path: path.display().to_string() }, &format!("path={}", path.display()), Some(self.seed));
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        let total_vectors: usize = self.inverted_lists.iter().map(|l| l.len()).sum();
+        total_vectors.saturating_sub(self.tombstones.len())
+    }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ThreadSafe Faiss IVF 包装器
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct ThreadSafeFaissIndex {
+    inner: RwLock<FaissConsciousnessIndex>,
+}
+
+impl Debug for ThreadSafeFaissIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThreadSafeFaissIndex").field("dim", &self.inner.read().map(|g| g.dim).unwrap_or(0)).finish()
+    }
+}
+
+impl ThreadSafeFaissIndex {
+    pub fn new(dim: usize, nlist: usize, nprobe: usize, seed: u64) -> Self {
+        Self { inner: RwLock::new(FaissConsciousnessIndex::new(dim, nlist, nprobe, seed)) }
+    }
+    pub fn add(&self, id: &str, vec: &[Float]) -> Result<()> {
+        self.inner.write().map_err(|_| LingShuError::BackendError("RwLock poisoned".into()))?.add_mut(id, vec)
+    }
+    pub fn remove(&self, id: &str) -> Result<()> {
+        self.inner.write().map_err(|_| LingShuError::BackendError("RwLock poisoned".into()))?.remove_mut(id)
+    }
+    pub fn query(&self, vec: &[Float], k: usize) -> Result<Vec<QueryResult>> {
+        self.inner.read().map_err(|_| LingShuError::BackendError("RwLock poisoned".into()))?.query_mut(vec, k)
+    }
+    pub fn train(&self, data: &[Float], params: &TrainParams) -> Result<()> {
+        self.inner.write().map_err(|_| LingShuError::BackendError("RwLock poisoned".into()))?.train_mut(data, params)
+    }
+    pub fn contains(&self, id: &str) -> bool {
+        self.inner.read().map(|g| g.id_map.contains(id) && {
+            g.id_map.get_num(id).map_or(false, |nid| !g.tombstones.contains(&nid))
+        }).unwrap_or(false)
+    }
+    pub fn persist(&self, path: &Path) -> Result<()> {
+        self.inner.read().map_err(|_| LingShuError::BackendError("RwLock poisoned".into()))?.persist_mut(path)
+    }
+    pub fn load(&self, path: &Path) -> Result<()> {
+        self.inner.write().map_err(|_| LingShuError::BackendError("RwLock poisoned".into()))?.load_mut(path)
+    }
+    pub fn compact(&self) -> Result<usize> {
+        self.inner.write().map_err(|_| LingShuError::BackendError("RwLock poisoned".into()))?.compact_mut()
+    }
+    pub fn len(&self) -> usize { self.inner.read().map(|g| g.len()).unwrap_or(0) }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+    pub fn is_trained(&self) -> bool { self.inner.read().map(|g| g.trained).unwrap_or(false) }
+}
+
+impl ConsciousnessIndex for ThreadSafeFaissIndex {
+    fn name(&self) -> &str { "faiss_ivf_threadsafe" }
+    fn dimension(&self) -> usize { self.inner.read().map(|g| g.dim).unwrap_or(0) }
+    fn add(&self, id: &str, vector: &[Float]) -> Result<()> { self.add(id, vector) }
+    fn remove(&self, id: &str) -> Result<()> { self.remove(id) }
+    fn query(&self, vector: &[Float], k: usize) -> Result<Vec<QueryResult>> { self.query(vector, k) }
+    fn contains(&self, id: &str) -> bool { self.contains(id) }
+    fn persist(&self, path: &Path) -> Result<()> { self.persist(path) }
+    fn load(&mut self, path: &Path) -> Result<()> { self.inner.write().map_err(|_| LingShuError::BackendError("RwLock poisoned".into()))?.load_mut(path) }
+    fn compact(&self) -> Result<usize> { self.compact() }
+    fn len(&self) -> usize { self.len() }
+    fn needs_training(&self) -> bool { true }
+    fn train(&self, data: &[Float], params: &TrainParams) -> Result<()> { self.train(data, params) }
+    fn is_trained(&self) -> bool { self.is_trained() }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第31层：工厂函数 — 根据硬件能力自动选择最佳索引
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 创建指定类型的索引（静态分发路径）
+pub fn create_index(dim: usize, index_type: &str, nlist: usize, seed: u64) -> Result<Box<dyn ConsciousnessIndex>> {
+    match index_type {
+        "native_lsh" => Ok(Box::new(ThreadSafeLshIndex::new(dim, 8, 16, seed))),
+        "hnsw" => Ok(Box::new(ThreadSafeHnswIndex::new(dim, 100000, 16, 200, 64, seed))),
+        "faiss_ivf" => Ok(Box::new(ThreadSafeFaissIndex::new(dim, nlist, 10, seed))),
+        _ => Err(LingShuError::InvalidParameter(format!("unknown index type: {index_type}"))),
+    }
+}
+
+/// 创建默认索引（自动根据硬件能力选择）
+pub fn create_default_index(dim: usize, hal: &Hal, seed: u64) -> Result<Box<dyn ConsciousnessIndex>> {
+    #[cfg(feature = "faiss")]
+    {
+        if hal.supports(HardwareCapability::Faiss) {
+            info!("Using Faiss IVF index (hardware: faiss detected)");
+            return create_index(dim, "faiss_ivf", dim.min(100), seed);
+        }
+    }
+    #[cfg(feature = "simd")]
+    {
+        if hal.supports(HardwareCapability::Simd) || hal.supports(HardwareCapability::Avx2) {
+            info!("Using HNSW index (hardware: SIMD detected)");
+            return create_index(dim, "hnsw", 0, seed);
+        }
+    }
+    info!("Using Native LSH index (no special hardware detected)");
+    create_index(dim, "native_lsh", 0, seed)
+}
+
+/// 灵枢核心ANN索引工厂：智能选择 + 适配器包装
+/// 返回的索引可通过 ConsciousnessIndexAdapter 桥接到 ApproximateNearestNeighborSearch
+pub fn create_ling_shu_ann_index(dim: usize, hal: &Hal) -> Result<Arc<dyn ConsciousnessIndex>> {
+    let idx = create_default_index(dim, hal, 42)?;
+    // 将Box<dyn ConsciousnessIndex>转为Arc<dyn ConsciousnessIndex>
+    // 由于不能直接转换，我们重新创建Arc版本
+    #[cfg(feature = "faiss")]
+    {
+        if hal.supports(HardwareCapability::Faiss) {
+            return Ok(Arc::new(ThreadSafeFaissIndex::new(dim, dim.min(100), 10, 42)));
+        }
+    }
+    #[cfg(feature = "simd")]
+    {
+        if hal.supports(HardwareCapability::Simd) || hal.supports(HardwareCapability::Avx2) {
+            return Ok(Arc::new(ThreadSafeHnswIndex::new(dim, 100000, 16, 200, 64, 42)));
+        }
+    }
+    Ok(Arc::new(ThreadSafeLshIndex::new(dim, 8, 16, 42)))
+}
+
+/// 创建用于LingShuCore的ANN后端（适配器包装，兼容旧的 ApproximateNearestNeighborSearch 接口）
+pub fn create_ling_shu_ann_backend(dim: usize, hal: &Hal) -> Result<Arc<dyn ApproximateNearestNeighborSearch>> {
+    let idx = create_ling_shu_ann_index(dim, hal)?;
+    Ok(Arc::new(ConsciousnessIndexAdapter::new(idx)))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第32层：意识量化器（标量+乘积量化）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "quant")]
+pub struct ConsciousnessQuantizer {
+    dim: usize,
+    bits_per_dimension: usize,
+    global_min: Float,
+    global_max: Float,
+    codebook: Vec<Vec<Float>>,
+    num_subspaces: usize,
+    bits_per_subspace: usize,
+    subspace_dim: usize,
+}
+
+#[cfg(feature = "quant")]
+impl ConsciousnessQuantizer {
+    pub fn scalar_quantize(&self, vector: &[Float]) -> Result<Vec<u8>> {
+        let mut result = Vec::with_capacity(vector.len());
+        let levels = (1usize << self.bits_per_dimension) as f32;
+        for &val in vector {
+            let normalized = ((val - self.global_min) / (self.global_max - self.global_min)).clamp(0.0, 1.0);
+            let code = (normalized * (levels - 1.0)).round() as u8;
+            result.push(code);
+        }
+        Ok(result)
+    }
+
+    pub fn scalar_dequantize(&self, quantized: &[u8]) -> Vec<Float> {
+        quantized.iter().map(|&code| {
+            let levels = (1usize << self.bits_per_dimension) as f32;
+            self.global_min + (code as f32 / (levels - 1.0)) * (self.global_max - self.global_min)
+        }).collect()
+    }
+
+    pub fn product_quantize(&self, vector: &[Float]) -> Result<Vec<u16>> {
+        if vector.len() != self.dim { return Err(LingShuError::DimensionMismatch { expected: self.dim, got: vector.len() }); }
+        let mut codes = Vec::with_capacity(self.num_subspaces);
+        for subspace_idx in 0..self.num_subspaces {
+            let start = subspace_idx * self.subspace_dim;
+            let end = (start + self.subspace_dim).min(self.dim);
+            let sub_vector = &vector[start..end];
+            let mut best_code = 0u16;
+            let mut best_distance = Float::MAX;
+            let codebook_offset = subspace_idx * (1usize << self.bits_per_subspace);
+            for code in 0..(1usize << self.bits_per_subspace) {
+                if let Some(centroid) = self.codebook.get(codebook_offset + code) {
+                    let dist: Float = sub_vector.iter().zip(centroid.iter())
+                        .map(|(a, b)| (a - b) * (a - b)).sum();
+                    if dist < best_distance { best_distance = dist; best_code = code as u16; }
+                }
+            }
+            codes.push(best_code);
+        }
+        Ok(codes)
+    }
+
+    pub fn product_dequantize(&self, codes: &[u16]) -> Vec<Float> {
+        let mut result = vec![0.0; self.dim];
+        for (subspace_idx, &code) in codes.iter().enumerate() {
+            let start = subspace_idx * self.subspace_dim;
+            let end = (start + self.subspace_dim).min(self.dim);
+            let codebook_offset = subspace_idx * (1usize << self.bits_per_subspace);
+            if let Some(centroid) = self.codebook.get(codebook_offset + code as usize) {
+                for d in start..end { result[d] = centroid[d - start]; }
+            }
+        }
+        result
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第33层：Prometheus 指标注册与暴露
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "prom")]
+pub struct ConsciousnessMetrics {
+    pub registry: Registry,
+    pub consciousness_assimilation_counter: IntCounter,
+    pub active_memory_traces: IntGauge,
+    pub cognitive_evolution_depth_histogram: Histogram,
+}
+
+#[cfg(feature = "prom")]
+impl ConsciousnessMetrics {
+    pub fn create_default() -> Result<Self> {
+        let registry = Registry::new();
+        let counter_opts = Opts::new("consciousness_assimilation_total", "Total consciousness assimilations");
+        let consciousness_assimilation_counter = IntCounter::with_opts(counter_opts)
+            .map_err(|e| LingShuError::BackendError(format!("{:?}", e)))?;
+        registry.register(Box::new(consciousness_assimilation_counter.clone()))
+            .map_err(|e| LingShuError::BackendError(format!("{:?}", e)))?;
+        let gauge_opts = Opts::new("active_memory_traces", "Number of active memory traces");
+        let active_memory_traces = IntGauge::with_opts(gauge_opts)
+            .map_err(|e| LingShuError::BackendError(format!("{:?}", e)))?;
+        registry.register(Box::new(active_memory_traces.clone()))
+            .map_err(|e| LingShuError::BackendError(format!("{:?}", e)))?;
+        let hist_opts = HistogramOpts::new("cognitive_evolution_depth_seconds", "Cognitive evolution depth time distribution")
+            .buckets(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0]);
+        let cognitive_evolution_depth_histogram = Histogram::with_opts(hist_opts)
+            .map_err(|e| LingShuError::BackendError(format!("{:?}", e)))?;
+        registry.register(Box::new(cognitive_evolution_depth_histogram.clone()))
+            .map_err(|e| LingShuError::BackendError(format!("{:?}", e)))?;
+        Ok(Self { registry, consciousness_assimilation_counter, active_memory_traces, cognitive_evolution_depth_histogram })
+    }
+
+    pub fn export_to_string(&self) -> Result<String> {
+        let encoder = TextEncoder::new();
+        let mut buffer = Vec::new();
+        let metric_families = self.registry.gather();
+        encoder.encode(&metric_families, &mut buffer)
+            .map_err(|e| LingShuError::BackendError(format!("{:?}", e)))?;
+        String::from_utf8(buffer).map_err(|e| LingShuError::BackendError(format!("{:?}", e)))
+    }
+
+    pub fn start_metrics_server(self: Arc<Self>, addr: SocketAddr) -> tokio::runtime::Runtime {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1).enable_all().build().unwrap();
+        let metrics = self.clone();
+        rt.spawn(async move {
+            let make_svc = make_service_fn(|_conn| {
+                let m = metrics.clone();
+                async move {
+                    Ok::<_, hyper::Error>(service_fn(move |req: Request<Body>| {
+                        let m2 = m.clone();
+                        async move {
+                            match (req.method(), req.uri().path()) {
+                                (&Method::GET, "/metrics") => {
+                                    let body = m2.export_to_string().unwrap_or_default();
+                                    Ok::<_, hyper::Error>(Response::new(Body::from(body)))
+                                }
+                                _ => Ok(Response::builder().status(StatusCode::NOT_FOUND).body(Body::from("Not Found")).unwrap()),
+                            }
+                        }
+                    }))
+                }
+            });
+            if let Err(e) = Server::bind(&addr).serve(make_svc).await {
+                eprintln!("Metrics server error: {}", e);
+            }
+        });
+        rt
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PART 4: 灵枢核心 + 异步通道 + 工厂函数 + 测试
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第34层：灵枢核心（融合版）— 使用新的ANN工厂函数
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 灵枢核心：意识、演化、记忆、量化的统一协调器
+#[derive(Debug)]
+pub struct LingShuCore {
+    dimension: usize,
+    hal: Hal,
+    field_backend: ConsciousnessFieldBackend,
+    evolution_engine: Arc<dyn CognitiveEvolutionEngine>,
+    ann_backend: Arc<dyn ApproximateNearestNeighborSearch>,
+    consciousness_index: Option<Arc<dyn ConsciousnessIndex>>,
+    memory_field: Arc<SpatiotemporalMemoryField>,
+    background_stream: Arc<BackgroundConsciousnessStream>,
+    entangled_cache: Arc<SegmentedEntangledCache>,
+    #[cfg(feature = "quant")]
+    quantizer: Option<ConsciousnessQuantizer>,
+    #[cfg(feature = "prom")]
+    metrics: Option<Arc<ConsciousnessMetrics>>,
+}
+
+impl LingShuCore {
+    /// 创建灵枢核心（融合版）
+    /// ANN后端使用新的工厂函数 create_ling_shu_ann_backend，智能选择最佳索引
+    pub fn new(dimension: usize) -> Result<Self> {
+        let hal = Hal::detect();
+        info!("灵枢核心启动 - HAL检测结果: {:?}", hal.backend_recommendation());
+        let field_backend = ConsciousnessFieldBackend::auto_select(dimension, &hal);
+        let config = CognitiveEvolutionConfig {
+            input_dimension: dimension, microscopic_dimension: dimension / 2,
+            macroscopic_dimension: dimension, profound_dimension: dimension,
+            seed_dimension: dimension / 4, normalize_after_projection: true,
+            learning_rate: 0.01, regularization_strength: 0.001,
+            weight_initialization_scale: 0.01, use_bias_term: true,
+            enable_online_evolution: true,
+        };
+        #[cfg(feature = "persistence")]
+        let evolution_engine: Arc<dyn CognitiveEvolutionEngine> = Arc::new(LinearCognitiveEvolutionEngine::new(
+            config.clone(), field_backend.clone(), None,
+        ));
+        #[cfg(not(feature = "persistence"))]
+        let evolution_engine: Arc<dyn CognitiveEvolutionEngine> = Arc::new(LinearCognitiveEvolutionEngine::new(
+            config.clone(), field_backend.clone(),
+        ));
+
+        // ★ 融合修改：使用新的ANN工厂函数替代旧的原生暴力扫描
+        let ann_backend = create_ling_shu_ann_backend(dimension, &hal)?;
+
+        // 保存ConsciousnessIndex引用（用于新接口调用）
+        let consciousness_index = match create_ling_shu_ann_index(dimension, &hal) {
+            Ok(idx) => Some(idx),
+            Err(e) => { warn!("创建ConsciousnessIndex失败，退化为仅ANN后端: {}", e); None }
+        };
+
+        let memory_field = Arc::new(SpatiotemporalMemoryField::new(10000, 16, field_backend.clone()));
+        let background_stream = Arc::new(BackgroundConsciousnessStream::new(dimension));
+        let entangled_cache = Arc::new(SegmentedEntangledCache::new(10000, 16));
+        #[cfg(feature = "quant")]
+        let quantizer = None;
+        #[cfg(feature = "prom")]
+        let metrics = None;
+        Ok(Self { dimension, hal, field_backend, evolution_engine, ann_backend, consciousness_index,
+            memory_field, background_stream, entangled_cache,
+            #[cfg(feature = "quant")] quantizer,
+            #[cfg(feature = "prom")] metrics,
+        })
+    }
+
+    /// 用显式ANN后端创建（高级用法）
+    pub fn with_ann_backend(dimension: usize, ann_backend: Arc<dyn ApproximateNearestNeighborSearch>) -> Result<Self> {
+        let hal = Hal::detect();
+        let field_backend = ConsciousnessFieldBackend::auto_select(dimension, &hal);
+        let config = CognitiveEvolutionConfig {
+            input_dimension: dimension, microscopic_dimension: dimension / 2,
+            macroscopic_dimension: dimension, profound_dimension: dimension,
+            seed_dimension: dimension / 4, normalize_after_projection: true,
+            learning_rate: 0.01, regularization_strength: 0.001,
+            weight_initialization_scale: 0.01, use_bias_term: true,
+            enable_online_evolution: true,
+        };
+        #[cfg(feature = "persistence")]
+        let evolution_engine: Arc<dyn CognitiveEvolutionEngine> = Arc::new(LinearCognitiveEvolutionEngine::new(
+            config.clone(), field_backend.clone(), None,
+        ));
+        #[cfg(not(feature = "persistence"))]
+        let evolution_engine: Arc<dyn CognitiveEvolutionEngine> = Arc::new(LinearCognitiveEvolutionEngine::new(
+            config.clone(), field_backend.clone(),
+        ));
+        let memory_field = Arc::new(SpatiotemporalMemoryField::new(10000, 16, field_backend.clone()));
+        let background_stream = Arc::new(BackgroundConsciousnessStream::new(dimension));
+        let entangled_cache = Arc::new(SegmentedEntangledCache::new(10000, 16));
+        #[cfg(feature = "quant")]
+        let quantizer = None;
+        #[cfg(feature = "prom")]
+        let metrics = None;
+        Ok(Self { dimension, hal, field_backend, evolution_engine, ann_backend,
+            consciousness_index: None, memory_field, background_stream, entangled_cache,
+            #[cfg(feature = "quant")] quantizer,
+            #[cfg(feature = "prom")] metrics,
+        })
+    }
+
+    // 核心API：同化意识
+    pub fn assimilate_consciousness(&self, id: &str, vector: &[Float], temporal: HashMap<String, String>,
+        spatial: HashMap<String, String>, emotional: Float, importance: Float) -> Result<()> {
+        if vector.len() != self.dimension {
+            return Err(LingShuError::DimensionMismatch { expected: self.dimension, got: vector.len() });
+        }
+        let trace = MemoryTrace {
+            id: id.to_string(), consciousness_vector: vector.to_vec(),
+            temporal_context: temporal, spatial_context: spatial,
+            emotional_valence: emotional, importance_weight: importance,
+            creation_time: Instant::now(),
+            last_access_time: AtomicCell::new(Instant::now()),
+            access_count: AtomicCell::new(0),
+        };
+        self.memory_field.store_trace(trace);
+        self.ann_backend.add_consciousness(id, vector)?;
+        self.background_stream.assimilate_experience(vector)?;
+        let item = MemoryItem { id: id.to_string(), vector: vector.to_vec(),
+            metadata: HashMap::new(), timestamp: Instant::now() };
+        self.entangled_cache.insert(item);
+        // 同步到 consciousness_index（如果已初始化）
+        if let Some(ref idx) = self.consciousness_index {
+            let _ = idx.add(id, vector);
+        }
+        #[cfg(feature = "prom")]
+        if let Some(ref m) = self.metrics { m.consciousness_assimilation_counter.inc(); }
+        Ok(())
+    }
+
+    // 核心API：演化意识
+    pub fn evolve_consciousness(&self, depth: CognitiveDepth, experience: &[Float]) -> Result<Vec<Float>> {
+        let out_dim = self.evolution_engine.depth_dimension(depth);
+        let mut output = vec![0.0; out_dim];
+        self.evolution_engine.project_to_depth(depth, experience, &mut output)?;
+        #[cfg(feature = "prom")]
+        if let Some(ref m) = self.metrics { m.cognitive_evolution_depth_histogram.observe(0.01); }
+        Ok(output)
+    }
+
+    // 核心API：检索记忆
+    pub fn retrieve_memories(&self, query: &[Float], k: usize, temporal: Option<&HashMap<String, String>>,
+        spatial: Option<&HashMap<String, String>>, emotion: Option<Float>) -> Result<Vec<MemoryRetrievalResult>> {
+        self.memory_field.retrieve_traces(query, k, temporal, spatial, emotion)
+    }
+
+    // 核心API：检索缓存
+    pub fn retrieve_cache(&self, query: &[Float], k: usize) -> Result<Vec<SearchResult>> {
+        self.entangled_cache.query_similar(query, &self.field_backend, k)
+    }
+
+    // 核心API：计算异常分数
+    pub fn calculate_anomaly(&self, consciousness: &[Float]) -> Result<Float> {
+        self.background_stream.calculate_anomaly_score(consciousness)
+    }
+
+    // 核心API：获取背景均值
+    pub fn get_background_mean(&self) -> Vec<Float> {
+        self.background_stream.get_collective_mean()
+    }
+
+    // 核心API：归一化
+    pub fn normalize(&self, v: &mut [Float]) -> Result<()> {
+        self.field_backend.normalize_consciousness(v)
+    }
+
+    // 核心API：共鸣度
+    pub fn resonance(&self, a: &[Float], b: &[Float]) -> Result<Float> {
+        self.field_backend.resonance_degree(a, b)
+    }
+
+    // 核心API：内积
+    pub fn inner_product(&self, a: &[Float], b: &[Float]) -> Result<Float> {
+        self.field_backend.inner_product(a, b)
+    }
+
+    // 通过ANN后端搜索（旧接口）
+    pub fn search_consciousness(&self, query: &[Float], k: usize) -> Result<Vec<MemoryRetrievalResult>> {
+        self.ann_backend.search_consciousness(query, k)
+    }
+
+    // 通过ConsciousnessIndex搜索（新接口）
+    pub fn query_index(&self, query: &[Float], k: usize) -> Result<Vec<QueryResult>> {
+        if let Some(ref idx) = self.consciousness_index {
+            idx.query(query, k)
+        } else {
+            let results = self.ann_backend.search_consciousness(query, k)?;
+            Ok(results.into_iter().map(|r| QueryResult {
+                id: r.trace_id, distance: 1.0 - r.resonance_score, score: r.combined_score,
+            }).collect())
+        }
+    }
+
+    // 获取维度
+    pub fn dimension(&self) -> usize { self.dimension }
+    pub fn hal(&self) -> &Hal { &self.hal }
+    pub fn evolution_engine(&self) -> &Arc<dyn CognitiveEvolutionEngine> { &self.evolution_engine }
+    pub fn memory_field(&self) -> &Arc<SpatiotemporalMemoryField> { &self.memory_field }
+    pub fn background_stream(&self) -> &Arc<BackgroundConsciousnessStream> { &self.background_stream }
+    pub fn entangled_cache(&self) -> &Arc<SegmentedEntangledCache> { &self.entangled_cache }
+
+    #[cfg(feature = "quant")]
+    pub fn quantize(&self, vector: &[Float]) -> Result<Vec<u8>> {
+        if let Some(ref q) = self.quantizer { q.scalar_quantize(vector) }
+        else { Err(LingShuError::InvalidParameter("量化器未初始化".into())) }
+    }
+
+    #[cfg(feature = "prom")]
+    pub fn start_metrics(&self, addr: SocketAddr) -> Option<tokio::runtime::Runtime> {
+        if let Some(ref m) = self.metrics { Some(m.clone().start_metrics_server(addr)) }
+        else { None }
+    }
+
+    #[cfg(feature = "prom")]
+    pub fn export_metrics(&self) -> Result<String> {
+        if let Some(ref m) = self.metrics { m.export_to_string() }
+        else { Err(LingShuError::InvalidParameter("指标未初始化".into())) }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第35层：异步意识同化通道（#[cfg(feature = "async")]）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 异步摄取命令
+#[cfg(feature = "async")]
+#[derive(Debug)]
+pub enum IngestionCommand {
+    Assimilate {
+        id: String,
+        vector: Vec<Float>,
+        temporal: HashMap<String, String>,
+        spatial: HashMap<String, String>,
+        emotional: Float,
+        importance: Float,
+        respond_to: Option<oneshot::Sender<Result<()>>>,
+    },
+    Retrieve {
+        query: Vec<Float>,
+        k: usize,
+        respond_to: oneshot::Sender<Result<Vec<MemoryRetrievalResult>>>,
+    },
+    Evolve {
+        depth: CognitiveDepth,
+        experience: Vec<Float>,
+        respond_to: oneshot::Sender<Result<Vec<Float>>>,
+    },
+    Shutdown {
+        respond_to: oneshot::Sender<Result<()>>,
+    },
+}
+
+/// 创建异步意识同化通道
+#[cfg(feature = "async")]
+pub fn create_consciousness_ingestion_channel(
+    core: Arc<Mutex<LingShuCore>>,
+    buffer_size: usize,
+) -> mpsc::Sender<IngestionCommand> {
+    let (tx, mut rx) = mpsc::channel::<IngestionCommand>(buffer_size);
+    task::spawn(async move {
+        while let Some(cmd) = rx.recv().await {
+            match cmd {
+                IngestionCommand::Assimilate { id, vector, temporal, spatial, emotional, importance, respond_to } => {
+                    let result = {
+                        let core = core.lock().unwrap();
+                        core.assimilate_consciousness(&id, &vector, temporal, spatial, emotional, importance)
+                    };
+                    if let Some(sender) = respond_to { let _ = sender.send(result); }
+                }
+                IngestionCommand::Retrieve { query, k, respond_to } => {
+                    let result = {
+                        let core = core.lock().unwrap();
+                        core.memory_field.retrieve_traces(&query, k, None, None, None)
+                    };
+                    let _ = respond_to.send(result);
+                }
+                IngestionCommand::Evolve { depth, experience, respond_to } => {
+                    let result = {
+                        let core = core.lock().unwrap();
+                        core.evolve_consciousness(depth, &experience)
+                    };
+                    let _ = respond_to.send(result);
+                }
+                IngestionCommand::Shutdown { respond_to } => {
+                    let _ = respond_to.send(Ok(()));
+                    break;
+                }
+            }
+        }
+    });
+    tx
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第36层：工厂函数 — 创建灵枢核心实例
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 创建默认灵枢核心实例（自动检测硬件）
+pub fn create_default_ling_shu_core(dimension: usize) -> Result<LingShuCore> {
+    LingShuCore::new(dimension)
+}
+
+/// 创建带Prometheus指标的灵枢核心
+#[cfg(feature = "prom")]
+pub fn create_ling_shu_core_with_metrics(dimension: usize) -> Result<(LingShuCore, Arc<ConsciousnessMetrics>)> {
+    let mut core = LingShuCore::new(dimension)?;
+    let metrics = Arc::new(ConsciousnessMetrics::create_default()?);
+    core.metrics = Some(metrics.clone());
+    Ok((core, metrics))
+}
+
+/// 创建带WAL持久化的灵枢核心
+#[cfg(feature = "persistence")]
+pub fn create_ling_shu_core_with_wal(dimension: usize, wal_path: &str) -> Result<LingShuCore> {
+    let hal = Hal::detect();
+    let field_backend = ConsciousnessFieldBackend::auto_select(dimension, &hal);
+    let wal = Arc::new(Mutex::new(WriteAheadLog::open(wal_path)?));
+    let config = CognitiveEvolutionConfig {
+        input_dimension: dimension, microscopic_dimension: dimension / 2,
+        macroscopic_dimension: dimension, profound_dimension: dimension,
+        seed_dimension: dimension / 4, normalize_after_projection: true,
+        learning_rate: 0.01, regularization_strength: 0.001,
+        weight_initialization_scale: 0.01, use_bias_term: true,
+        enable_online_evolution: true,
+    };
+    let evolution_engine: Arc<dyn CognitiveEvolutionEngine> = Arc::new(LinearCognitiveEvolutionEngine::new(
+        config.clone(), field_backend.clone(), Some(wal.clone()),
+    ));
+    let ann_backend = create_ling_shu_ann_backend(dimension, &hal)?;
+    let memory_field = Arc::new(SpatiotemporalMemoryField::new(10000, 16, field_backend.clone()));
+    let background_stream = Arc::new(BackgroundConsciousnessStream::new(dimension));
+    let entangled_cache = Arc::new(SegmentedEntangledCache::new(10000, 16));
+    #[cfg(feature = "quant")]
+    let quantizer = None;
+    #[cfg(feature = "prom")]
+    let metrics = None;
+    Ok(LingShuCore { dimension, hal, field_backend, evolution_engine, ann_backend,
+        consciousness_index: None, memory_field, background_stream, entangled_cache,
+        #[cfg(feature = "quant")] quantizer,
+        #[cfg(feature = "prom")] metrics,
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第37层：测试 — 验证融合系统的完整性
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- 基础辅助函数测试 ---
+
+    #[test]
+    fn test_simple_hash() {
+        let h1 = simple_hash(b"hello");
+        let h2 = simple_hash(b"hello");
+        let h3 = simple_hash(b"world");
+        assert_eq!(h1, h2);
+        assert_ne!(h1, h3);
+    }
+
+    #[test]
+    fn test_kahan_sum() {
+        let v = vec![1.0f32, 2.0, 3.0];
+        let sum = kahan_sum_squares(&v);
+        assert!((sum - 14.0).abs() < 1e-6);
+    }
+
+    // --- HAL测试 ---
+
+    #[test]
+    fn test_hal_detect() {
+        let hal = Hal::detect();
+        assert!(!hal.capabilities.is_empty());
+    }
+
+    // --- CPU意识场测试 ---
+
+    #[test]
+    fn test_cpu_normalize() {
+        let field = CpuConsciousnessField::new(4);
+        let mut v = vec![1.0f32, 2.0, 2.0, 1.0];
+        field.normalize_consciousness(&mut v).unwrap();
+        let norm = v.iter().map(|x| x * x).sum::<Float>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_cpu_resonance() {
+        let field = CpuConsciousnessField::new(3);
+        let a = vec![1.0f32, 0.0, 0.0];
+        let b = vec![1.0f32, 0.0, 0.0];
+        let r = field.resonance_degree(&a, &b).unwrap();
+        assert!((r - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_cpu_inner_product() {
+        let field = CpuConsciousnessField::new(3);
+        let a = vec![1.0f32, 2.0, 3.0];
+        let b = vec![4.0f32, 5.0, 6.0];
+        let dot = field.inner_product(&a, &b).unwrap();
+        assert!((dot - 32.0).abs() < 1e-5);
+    }
+
+    // --- ConsciousnessFieldBackend自动选择测试 ---
+
+    #[test]
+    fn test_backend_auto_select() {
+        let hal = Hal::detect();
+        let backend = ConsciousnessFieldBackend::auto_select(4, &hal);
+        assert_eq!(backend.dimension(), 4);
+        let mut v = vec![1.0f32, 2.0, 2.0, 1.0];
+        backend.normalize_consciousness(&mut v).unwrap();
+        let norm = v.iter().map(|x| x * x).sum::<Float>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5);
+    }
+
+    // --- IdMap测试 ---
+
+    #[test]
+    fn test_id_map() {
+        let mut map = IdMap::new();
+        let n1 = map.insert("id1".to_string()).unwrap();
+        let n2 = map.insert("id2".to_string()).unwrap();
+        assert_eq!(map.get_str(n1), Some("id1"));
+        assert_eq!(map.get_str(n2), Some("id2"));
+        assert_eq!(map.get_num("id1"), Some(n1));
+        assert!(map.contains("id1"));
+        assert!(!map.contains("id3"));
+    }
+
+    #[test]
+    fn test_id_map_duplicate() {
+        let mut map = IdMap::new();
+        map.insert("id1".to_string()).unwrap();
+        assert!(map.insert("id1".to_string()).is_err());
+    }
+
+    // --- MetricType测试 ---
+
+    #[test]
+    fn test_metric_type_l2() {
+        let field = CpuConsciousnessField::new(2);
+        let a = vec![0.0f32, 0.0];
+        let b = vec![3.0f32, 4.0];
+        let dist = field.compute_distance(&a, &b, MetricType::L2);
+        assert!((dist - 25.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_metric_type_cosine() {
+        let field = CpuConsciousnessField::new(2);
+        let a = vec![1.0f32, 0.0];
+        let b = vec![1.0f32, 0.0];
+        let dist = field.compute_distance(&a, &b, MetricType::Cosine);
+        assert!(dist.abs() < 1e-5);
+    }
+
+    // --- 认知演化引擎测试 ---
+
+    #[test]
+    fn test_evolution_engine_projection() {
+        let dim = 8;
+        let hal = Hal::detect();
+        let field = ConsciousnessFieldBackend::auto_select(dim, &hal);
+        let config = CognitiveEvolutionConfig {
+            input_dimension: dim, microscopic_dimension: dim / 2,
+            macroscopic_dimension: dim, profound_dimension: dim,
+            seed_dimension: dim / 4, normalize_after_projection: false,
+            learning_rate: 0.01, regularization_strength: 0.001,
+            weight_initialization_scale: 0.01, use_bias_term: true,
+            enable_online_evolution: true,
+        };
+        #[cfg(feature = "persistence")]
+        let engine: Arc<dyn CognitiveEvolutionEngine> = Arc::new(LinearCognitiveEvolutionEngine::new(
+            config, field.clone(), None,
+        ));
+        #[cfg(not(feature = "persistence"))]
+        let engine: Arc<dyn CognitiveEvolutionEngine> = Arc::new(LinearCognitiveEvolutionEngine::new(
+            config, field.clone(),
+        ));
+        let input = vec![1.0f32; dim];
+        let mut output = vec![0.0f32; dim / 2];
+        engine.project_to_depth(CognitiveDepth::Microscopic, &input, &mut output).unwrap();
+        assert!(!output.iter().all(|&x| x == 0.0));
+    }
+
+    // --- 背景意识流测试 ---
+
+    #[test]
+    fn test_background_stream() {
+        let stream = BackgroundConsciousnessStream::new(4);
+        let v1 = vec![1.0f32, 0.0, 0.0, 0.0];
+        let v2 = vec![-1.0f32, 0.0, 0.0, 0.0];
+        stream.assimilate_experience(&v1).unwrap();
+        stream.assimilate_experience(&v2).unwrap();
+        let mean = stream.get_collective_mean();
+        assert!(mean.iter().all(|&x| x.abs() < 0.1));
+    }
+
+    // --- 分段纠缠缓存测试 ---
+
+    #[test]
+    fn test_segmented_cache() {
+        let cache = SegmentedEntangledCache::new(100, 4);
+        let item = MemoryItem { id: "test1".to_string(), vector: vec![1.0, 0.0, 0.0],
+            metadata: HashMap::new(), timestamp: Instant::now() };
+        cache.insert(item);
+        let retrieved = cache.get("test1");
+        assert!(retrieved.is_some());
+    }
+
+    // --- 时空记忆场测试 ---
+
+    #[test]
+    fn test_spatiotemporal_memory_field() {
+        let hal = Hal::detect();
+        let field = ConsciousnessFieldBackend::auto_select(4, &hal);
+        let mem = SpatiotemporalMemoryField::new(100, 4, field);
+        let trace = MemoryTrace {
+            id: "test1".to_string(), consciousness_vector: vec![1.0, 0.0, 0.0, 0.0],
+            temporal_context: HashMap::new(), spatial_context: HashMap::new(),
+            emotional_valence: 0.5, importance_weight: 1.0,
+            creation_time: Instant::now(),
+            last_access_time: AtomicCell::new(Instant::now()),
+            access_count: AtomicCell::new(0),
+        };
+        mem.store_trace(trace);
+        let results = mem.retrieve_traces(&[1.0, 0.0, 0.0, 0.0], 5, None, None, None).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].trace_id, "test1");
+    }
+
+    // --- LSH索引测试 ---
+
+    #[test]
+    fn test_lsh_index() {
+        let mut idx = NativeConsciousnessIndex::new(4, 4, 8, 42);
+        idx.add_mut("id1", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.add_mut("id2", &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        idx.add_mut("id3", &[0.0, 0.0, 1.0, 0.0]).unwrap();
+        let results = idx.query(&[1.0, 0.0, 0.0, 0.0], 3).unwrap();
+        assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn test_lsh_remove() {
+        let mut idx = NativeConsciousnessIndex::new(4, 4, 8, 42);
+        idx.add_mut("id1", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        assert!(idx.contains("id1"));
+        idx.remove_mut("id1").unwrap();
+        assert!(!idx.contains("id1"));
+    }
+
+    #[test]
+    fn test_lsh_compact() {
+        let mut idx = NativeConsciousnessIndex::new(4, 4, 8, 42);
+        idx.add_mut("id1", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.remove_mut("id1").unwrap();
+        let removed = idx.compact_mut().unwrap();
+        assert_eq!(removed, 1);
+    }
+
+    #[test]
+    fn test_lsh_audit() {
+        let mut idx = NativeConsciousnessIndex::new(4, 4, 8, 42);
+        idx.add_mut("id1", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        assert!(!idx.audit_log().is_empty());
+    }
+
+    // --- ThreadSafe LSH索引测试 ---
+
+    #[test]
+    fn test_threadsafe_lsh() {
+        let idx = ThreadSafeLshIndex::new(4, 4, 8, 42);
+        idx.add("id1", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.add("id2", &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        let results = idx.query(&[1.0, 0.0, 0.0, 0.0], 2).unwrap();
+        assert!(!results.is_empty());
+    }
+
+    // --- HNSW索引测试 ---
+
+    #[test]
+    fn test_hnsw_index() {
+        let mut idx = HnswIndex::new(4, 1000, 8, 50, 20, 42);
+        idx.add_mut("id1", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.add_mut("id2", &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        let results = idx.query_mut(&[1.0, 0.0, 0.0, 0.0], 2).unwrap();
+        assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn test_hnsw_remove() {
+        let mut idx = HnswIndex::new(4, 1000, 8, 50, 20, 42);
+        idx.add_mut("id1", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        assert!(idx.id_map.contains("id1"));
+        idx.remove_mut("id1").unwrap();
+    }
+
+    // --- ThreadSafe HNSW索引测试 ---
+
+    #[test]
+    fn test_threadsafe_hnsw() {
+        let idx = ThreadSafeHnswIndex::new(4, 1000, 8, 50, 20, 42);
+        idx.add("id1", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.add("id2", &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        let results = idx.query(&[1.0, 0.0, 0.0, 0.0], 2).unwrap();
+        assert!(!results.is_empty());
+    }
+
+    // --- Faiss IVF索引测试 ---
+
+    #[test]
+    fn test_faiss_ivf_index() {
+        let mut idx = FaissConsciousnessIndex::new(4, 4, 2, 42);
+        let train_data = &[
+            1.0f32, 0.0, 0.0, 0.0,
+            0.9, 0.1, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.1, 0.9, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.9, 0.1,
+            0.0, 0.0, 0.0, 1.0,
+            0.1, 0.0, 0.0, 0.9,
+        ];
+        let params = TrainParams::default();
+        idx.train_mut(train_data, &params).unwrap();
+        assert!(idx.trained);
+        idx.add_mut("id1", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.add_mut("id2", &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        let results = idx.query_mut(&[1.0, 0.0, 0.0, 0.0], 2).unwrap();
+        assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn test_faiss_ivf_needs_training() {
+        let idx = FaissConsciousnessIndex::new(4, 4, 2, 42);
+        assert!(idx.needs_training());
+        assert!(!idx.is_trained());
+    }
+
+    // --- KMeans测试 ---
+
+    #[test]
+    fn test_kmeans() {
+        let data = &[
+            1.0f32, 0.0, 0.0, 0.0,
+            0.9, 0.1, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.1, 0.9, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.9, 0.1,
+            0.0, 0.0, 0.0, 1.0,
+            0.1, 0.0, 0.0, 0.9,
+        ];
+        let (centroids, assignments) = kmeans(data, 4, 4, 25, 42, 1e-4);
+        assert_eq!(centroids.len(), 16); // 4 clusters * 4 dim
+        assert_eq!(assignments.len(), 8);
+    }
+
+    // --- 工厂函数测试 ---
+
+    #[test]
+    fn test_create_index() {
+        let idx = create_index(4, "native_lsh", 0, 42).unwrap();
+        assert_eq!(idx.dimension(), 4);
+    }
+
+    #[test]
+    fn test_create_default_index() {
+        let hal = Hal::detect();
+        let idx = create_default_index(4, &hal, 42).unwrap();
+        assert_eq!(idx.dimension(), 4);
+    }
+
+    // --- 持久化测试 ---
+
+    #[test]
+    fn test_persistence_header() {
+        let header = PersistenceHeader::new("test_index", 128, 1000);
+        assert_eq!(header.magic, PersistenceHeader::MAGIC);
+        assert_eq!(header.version, PersistenceHeader::VERSION);
+        assert_eq!(header.index_kind, "test_index");
+        assert_eq!(header.dim, 128);
+        assert_eq!(header.count, 1000);
+    }
+
+    // --- LingShuError映射测试 ---
+
+    #[test]
+    fn test_error_variants() {
+        let e1 = LingShuError::NotFound;
+        assert!(e1.to_string().contains("未找到"));
+        let e2 = LingShuError::PersistenceError("test".into());
+        assert!(e2.to_string().contains("持久化"));
+        let e3 = LingShuError::SerializationError("test".into());
+        assert!(e3.to_string().contains("序列化"));
+    }
+
+    // --- 灵枢核心集成测试 ---
+
+    #[test]
+    fn test_ling_shu_core_creation() {
+        let core = LingShuCore::new(8).unwrap();
+        assert_eq!(core.dimension(), 8);
+    }
+
+    #[test]
+    fn test_ling_shu_core_assimilate_and_retrieve() {
+        let core = LingShuCore::new(4).unwrap();
+        let vec = vec![1.0f32, 0.0, 0.0, 0.0];
+        core.assimilate_consciousness("trace1", &vec, HashMap::new(), HashMap::new(), 0.5, 1.0).unwrap();
+        let results = core.retrieve_memories(&[1.0, 0.0, 0.0, 0.0], 5, None, None, None).unwrap();
+        assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn test_ling_shu_core_search() {
+        let core = LingShuCore::new(4).unwrap();
+        let vec = vec![1.0f32, 0.0, 0.0, 0.0];
+        core.assimilate_consciousness("trace1", &vec, HashMap::new(), HashMap::new(), 0.5, 1.0).unwrap();
+        let results = core.search_consciousness(&[1.0, 0.0, 0.0, 0.0], 5).unwrap();
+        assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn test_ling_shu_core_query_index() {
+        let core = LingShuCore::new(4).unwrap();
+        let vec = vec![1.0f32, 0.0, 0.0, 0.0];
+        core.assimilate_consciousness("trace1", &vec, HashMap::new(), HashMap::new(), 0.5, 1.0).unwrap();
+        let results = core.query_index(&[1.0, 0.0, 0.0, 0.0], 5).unwrap();
+        assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn test_ling_shu_core_normalize() {
+        let core = LingShuCore::new(4).unwrap();
+        let mut v = vec![1.0f32, 2.0, 2.0, 1.0];
+        core.normalize(&mut v).unwrap();
+        let norm = v.iter().map(|x| x * x).sum::<Float>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_ling_shu_core_evolve() {
+        let core = LingShuCore::new(8).unwrap();
+        let exp = vec![1.0f32; 8];
+        let out = core.evolve_consciousness(CognitiveDepth::Microscopic, &exp).unwrap();
+        assert_eq!(out.len(), 4);
+    }
+
+    #[test]
+    fn test_ling_shu_core_anomaly() {
+        let core = LingShuCore::new(4).unwrap();
+        let v1 = vec![1.0f32, 0.0, 0.0, 0.0];
+        let v2 = vec![1.0f32, 0.0, 0.0, 0.0];
+        core.background_stream().assimilate_experience(&v1).unwrap();
+        core.background_stream().assimilate_experience(&v2).unwrap();
+        let score = core.calculate_anomaly(&[1.0, 0.0, 0.0, 0.0]).unwrap();
+        assert!(score < 1.0);
+    }
+
+    #[test]
+    fn test_ling_shu_core_background_mean() {
+        let core = LingShuCore::new(4).unwrap();
+        let v = vec![1.0f32, 2.0, 3.0, 4.0];
+        core.background_stream().assimilate_experience(&v).unwrap();
+        let mean = core.get_background_mean();
+        assert_eq!(mean.len(), 4);
+    }
+
+    #[test]
+    fn test_ling_shu_core_resonance() {
+        let core = LingShuCore::new(3).unwrap();
+        let a = vec![1.0f32, 0.0, 0.0];
+        let b = vec![1.0f32, 0.0, 0.0];
+        let r = core.resonance(&a, &b).unwrap();
+        assert!((r - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_ling_shu_core_inner_product() {
+        let core = LingShuCore::new(3).unwrap();
+        let a = vec![1.0f32, 2.0, 3.0];
+        let b = vec![4.0f32, 5.0, 6.0];
+        let dot = core.inner_product(&a, &b).unwrap();
+        assert!((dot - 32.0).abs() < 1e-5);
+    }
+
+    // --- 审计日志测试 ---
+
+    #[test]
+    fn test_audit_log() {
+        let mut log = AuditLog::new();
+        assert!(log.is_empty());
+        log.record(AuditOp::Add { id: "test".to_string(), dim: 4 }, "test add", Some(42));
+        assert_eq!(log.len(), 1);
+        assert!(!log.is_empty());
+    }
+
+    // --- QueryResult转换测试 ---
+
+    #[test]
+    fn test_query_result_to_memory_retrieval_result() {
+        let qr = QueryResult { id: "test".to_string(), distance: 0.5, score: 0.8 };
+        let mr: MemoryRetrievalResult = qr.into();
+        assert_eq!(mr.trace_id, "test");
+        assert!((mr.resonance_score - 0.8).abs() < 1e-6);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 第38层：可执行入口 — 修复 E0601: main function not found
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn main() {
+    println!("灵枢智能辅助系统 v10 已启动");
+    println!("使用方法: 将本文件作为库引用，或运行 cargo test 执行测试");
+}
