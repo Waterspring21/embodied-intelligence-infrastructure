@@ -1,0 +1,2954 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// 织魂  ZhiHun  v2.0  —  生命记忆与技能执行引擎  第二乐章（修复版）
+// Weaving Soul — Life Memory & Embodied Skill Engine, Second Movement (Fixed)
+//
+// 修复内容：
+//   1. 修复 axum 0.7 API 变更 (axum::Server → tokio::net::TcpListener + axum::serve)
+//   2. 修复 sled IVec 类型转换问题
+//   3. 修复所有类型推断问题
+//   4. 添加缺失的 trait 实现
+//
+// Cargo.toml 依赖：
+// [dependencies]
+// tokio       = { version="1.36", features=["rt-multi-thread","macros","sync","time","signal","net"] }
+// sqlx        = { version="0.7",  features=["runtime-tokio-rustls","postgres","macros","uuid"] }
+// pgvector    = { version="0.6",  features=["sqlx-postgres"] }
+// onnxruntime = { version="0.18", features=["download"] }
+// tokenizers  = { version="0.15", features=["models","tokenizer"] }
+// rayon       = "1.7"
+// rocksdb     = "0.20"
+// wasmtime    = "9.0"
+// axum        = { version="0.7", features=["json","tokio"] }
+// prometheus  = "0.14"
+// serde       = { version="1.0", features=["derive"] }
+// serde_json  = "1.0"
+// bincode     = "1.3"
+// parking_lot = "0.12"
+// rand        = "0.8"
+// anyhow      = "1.0"
+// thiserror   = "1.0"
+// uuid        = { version="1.4", features=["v4"] }
+// async-trait = "0.1"
+// chrono      = { version="0.4", features=["serde"] }
+// once_cell   = "1.20"
+// tracing     = "0.1"
+// tracing-subscriber = { version="0.3", features=["fmt","env-filter"] }
+// ndarray     = "0.15"
+// reqwest     = { version="0.11", features=["json","rustls-tls"] }
+// sled        = "0.34"
+// clap        = { version="4", features=["derive"] }
+// tower       = "0.4"
+//
+// [dev-dependencies]
+// tempfile = "3"
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#![allow(dead_code, unused_variables, unused_imports, clippy::too_many_arguments)]
+
+// ─── standard ────────────────────────────────────────────────────────────────
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrd};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use std::{env, fs};
+
+// ─── async ───────────────────────────────────────────────────────────────────
+use tokio::sync::{mpsc, Semaphore, RwLock as TokioRwLock};
+use tokio::task;
+use tokio::net::TcpListener;
+
+// ─── serde ───────────────────────────────────────────────────────────────────
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value as JsonValue};
+
+// ─── error ───────────────────────────────────────────────────────────────────
+use anyhow::{anyhow, Context, Result};
+use thiserror::Error;
+
+// ─── time / logging ──────────────────────────────────────────────────────────
+use chrono::{DateTime, Utc};
+use tracing::{debug, error, info, warn};
+use once_cell::sync::Lazy;
+
+// ─── locking ─────────────────────────────────────────────────────────────────
+use parking_lot::RwLock;
+
+// ─── random ──────────────────────────────────────────────────────────────────
+use rand::{Rng, SeedableRng};
+use uuid::Uuid;
+
+// ─── HTTP / metrics ──────────────────────────────────────────────────────────
+use axum::{
+    extract::{Json, Path as AxumPath, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{delete, get, post},
+    Router,
+};
+use prometheus::{Encoder, IntCounter, IntGauge, Registry, TextEncoder};
+use async_trait::async_trait;
+use tower::ServiceBuilder;
+
+// ─── database ────────────────────────────────────────────────────────────────
+use sqlx::{postgres::PgPoolOptions, PgPool};
+use pgvector::Vector as PgVector;
+
+// ─── RocksDB ─────────────────────────────────────────────────────────────────
+use rocksdb::{Options as RocksOptions, DB as RocksDB, IteratorMode, DBCompressionType};
+
+// ─── WASM ────────────────────────────────────────────────────────────────────
+use wasmtime::{
+    Config as WasmConfig, Engine as WasmEngine, Linker as WasmLinker,
+    Module as WasmModule, OptLevel, Store as WasmStore,
+};
+
+// ─── rayon ───────────────────────────────────────────────────────────────────
+use rayon::prelude::*;
+
+// ─── ONNX + Tokenizer ────────────────────────────────────────────────────────
+use onnxruntime::{
+    environment::Environment as OnnxEnvironment, ndarray_tensor::NdArrayTensor,
+    session::SessionBuilder, GraphOptimizationLevel, LoggingLevel,
+};
+use tokenizers::{Encoding, Tokenizer};
+
+// ─── ndarray ─────────────────────────────────────────────────────────────────
+use ndarray::Array;
+
+// ─── CLI ─────────────────────────────────────────────────────────────────────
+use clap::{Parser, Subcommand};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// § 1  错误体系 — 14-Type Error Hierarchy
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Error, Clone)]
+pub enum ZhiHunError {
+    #[error("存储错误: {0}")]                    Storage(String),
+    #[error("序列化错误: {0}")]                  Serialization(String),
+    #[error("索引错误: {0}")]                    Index(String),
+    #[error("维度不匹配: 期望{expected} 实际{actual}")]
+    DimMismatch { expected: usize, actual: usize },
+    #[error("未找到: {0}")]                      NotFound(String),
+    #[error("技能执行错误: {0}")]                Skill(String),
+    #[error("WASM沙箱错误: {0}")]                Wasm(String),
+    #[error("配置错误: {0}")]                    Config(String),
+    #[error("网络错误: {0}")]                    Network(String),
+    #[error("并发错误: {0}")]                    Concurrency(String),
+    #[error("超时错误: {0}")]                    Timeout(String),
+    #[error("IO错误: {0}")]                      Io(String),
+    #[error("推理错误: {0}")]                    Onnx(String),
+    #[error("未知错误: {0}")]                    Other(String),
+}
+
+impl From<sled::Error>       for ZhiHunError { fn from(e: sled::Error) -> Self       { Self::Storage(e.to_string()) } }
+impl From<bincode::Error>    for ZhiHunError { fn from(e: bincode::Error) -> Self    { Self::Serialization(e.to_string()) } }
+impl From<serde_json::Error> for ZhiHunError { fn from(e: serde_json::Error) -> Self { Self::Serialization(e.to_string()) } }
+impl From<std::io::Error>    for ZhiHunError { fn from(e: std::io::Error) -> Self    { Self::Io(e.to_string()) } }
+impl From<sqlx::Error>       for ZhiHunError { fn from(e: sqlx::Error) -> Self       { Self::Storage(e.to_string()) } }
+impl From<wasmtime::Error>   for ZhiHunError { fn from(e: wasmtime::Error) -> Self   { Self::Wasm(e.to_string()) } }
+
+pub type ZResult<T> = Result<T, ZhiHunError>;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// § 2  Prometheus 可观测性 + 结构化统计
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static REGISTRY:     Lazy<Registry>   = Lazy::new(Registry::new);
+static MET_INSERTS:  Lazy<IntCounter> = Lazy::new(|| IntCounter::new("zhihun_inserts_total",     "Memory insertions").unwrap());
+static MET_QUERIES:  Lazy<IntCounter> = Lazy::new(|| IntCounter::new("zhihun_queries_total",     "Resonance queries").unwrap());
+static MET_SKILLS:   Lazy<IntCounter> = Lazy::new(|| IntCounter::new("zhihun_skill_execs_total", "Skill executions").unwrap());
+static MET_HOT_SZ:   Lazy<IntGauge>   = Lazy::new(|| IntGauge::new("zhihun_hot_size",            "Hot layer entries").unwrap());
+static MET_PRELOADS: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("zhihun_preloads_total",    "Preload ops").unwrap());
+
+pub fn init_metrics() {
+    REGISTRY.register(Box::new(MET_INSERTS.clone())).ok();
+    REGISTRY.register(Box::new(MET_QUERIES.clone())).ok();
+    REGISTRY.register(Box::new(MET_SKILLS.clone())).ok();
+    REGISTRY.register(Box::new(MET_HOT_SZ.clone())).ok();
+    REGISTRY.register(Box::new(MET_PRELOADS.clone())).ok();
+}
+
+/// 缓存统计（三层命中率）
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+pub struct CacheStats {
+    pub hot_size:    usize,
+    pub warm_size:   usize,
+    pub hot_hits:    u64,
+    pub warm_hits:   u64,
+    pub cold_misses: u64,
+}
+impl CacheStats {
+    pub fn hit_rate(&self) -> f64 {
+        let t = self.hot_hits + self.warm_hits + self.cold_misses;
+        if t == 0 { 0.0 } else { (self.hot_hits + self.warm_hits) as f64 / t as f64 }
+    }
+}
+
+/// 共鸣图统计
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+pub struct GraphStats {
+    pub node_count: usize,
+    pub edge_count: usize,
+    pub avg_degree: f64,
+    pub max_degree: usize,
+}
+
+/// 系统整体状态（单次健康检查聚合）
+#[derive(Debug, Clone, Serialize)]
+pub struct SystemStatus {
+    pub version:        &'static str,
+    pub uptime_seconds: u64,
+    pub bead_count:     usize,
+    pub graph:          GraphStats,
+    pub cache:          CacheStats,
+    pub skill_count:    usize,
+    pub alpha:          f32,
+    pub xi:             f32,
+    pub gamma:          f32,
+    pub hot_capacity:   usize,
+    pub vector_dim:     usize,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// § 3  配置体系 — from_file + validate
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZhiHunConfig {
+    pub vector_dim:               usize,
+    pub hot_capacity:             usize,
+    /// α 正向相似度权重
+    pub alpha:                    f32,
+    /// ξ 极性互补系数（右手↔左手泛化）
+    pub xi:                       f32,
+    /// γ 共现加权系数
+    pub gamma:                    f32,
+    pub hnsw_m:                   usize,
+    pub hnsw_ef_construction:     usize,
+    pub hnsw_ef_search:           usize,
+    pub candidate_mult:           usize,
+    pub preload_rate_hz:          u64,
+    pub preload_workers:          usize,
+    pub decay_half_life_secs:     i64,
+    /// lr 学习率（安全区间 [0.01, 0.30]）
+    pub online_learn_lr:          f32,
+    /// β 动量系数（FluxLearner v2）
+    pub momentum:                 f32,
+    pub ttl_check_interval_secs:  u64,
+    pub index_save_interval_secs: u64,
+    pub db_path:                  String,
+    pub hnsw_index_path:          String,
+    pub database_url:             String,
+    pub onnx_model_path:          String,
+    pub tokenizer_path:           String,
+    pub onnx_provider:            String,
+    pub warm_db_path:             String,
+    pub http_bind:                String,
+}
+
+impl Default for ZhiHunConfig {
+    fn default() -> Self {
+        Self {
+            vector_dim:               128,
+            hot_capacity:             50_000,
+            alpha:                    1.0,
+            xi:                       0.8,
+            gamma:                    0.4,
+            hnsw_m:                   16,
+            hnsw_ef_construction:     200,
+            hnsw_ef_search:           64,
+            candidate_mult:           4,
+            preload_rate_hz:          50,
+            preload_workers:          4,
+            decay_half_life_secs:     86_400,
+            online_learn_lr:          0.05,
+            momentum:                 0.90,
+            ttl_check_interval_secs:  30,
+            index_save_interval_secs: 300,
+            db_path:       "./zhihun_db".into(),
+            hnsw_index_path: "./zhihun_hnsw.bin".into(),
+            database_url:  env::var("DATABASE_URL").unwrap_or_default(),
+            onnx_model_path: env::var("ONNX_MODEL_PATH").unwrap_or_default(),
+            tokenizer_path: env::var("TOKENIZER_PATH").unwrap_or_default(),
+            onnx_provider: env::var("ONNX_PROVIDER").unwrap_or_else(|_| "CPU".into()),
+            warm_db_path:  env::var("WARM_DB_PATH").unwrap_or_else(|_| "./zhihun_warm".into()),
+            http_bind:     env::var("HTTP_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into()),
+        }
+    }
+}
+
+impl ZhiHunConfig {
+    pub fn from_file(p: &Path) -> ZResult<Self> {
+        let f = fs::File::open(p)?;
+        serde_json::from_reader(f).map_err(|e| ZhiHunError::Config(format!("parse: {}", e)))
+    }
+
+    pub fn validate(&self) -> ZResult<()> {
+        if self.vector_dim == 0 { return Err(ZhiHunError::Config("vector_dim=0".into())); }
+        if self.hot_capacity == 0 { return Err(ZhiHunError::Config("hot_capacity=0".into())); }
+        if self.hnsw_m < 2 { return Err(ZhiHunError::Config("hnsw_m<2".into())); }
+        if !(0.0..=1.0).contains(&self.online_learn_lr) {
+            return Err(ZhiHunError::Config("online_learn_lr∉[0,1]".into()));
+        }
+        if !(0.0..=1.0).contains(&self.momentum) {
+            return Err(ZhiHunError::Config("momentum∉[0,1]".into()));
+        }
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// § 4  核心数据类型
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 魂珠元数据（访问计数/置信度/来源/自定义属性）
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BeadMetadata {
+    pub access_count:  u64,
+    pub source:        String,
+    pub confidence:    f32,
+    pub last_accessed: i64,
+    pub custom:        HashMap<String, String>,
+}
+impl BeadMetadata {
+    pub fn touch(&mut self) {
+        self.access_count += 1;
+        self.last_accessed = Utc::now().timestamp();
+    }
+}
+
+/// 记忆珠 MemoryBead — 单条记忆（含TTL/反向向量/元数据/版本）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryBead {
+    pub id:          String,
+    pub tags:        Vec<String>,
+    /// 归一化正向向量
+    pub vector:      Vec<f32>,
+    /// 归一化反向向量（ξ极性互补评分用）
+    pub neg_vector:  Vec<f32>,
+    pub payload:     JsonValue,
+    pub created_at:  i64,
+    pub ttl_seconds: Option<u64>,
+    pub version:     u32,
+    pub bead_meta:   BeadMetadata,
+}
+
+impl MemoryBead {
+    pub fn new(tags: Vec<String>, vector: Vec<f32>, payload: JsonValue) -> Self {
+        let v   = normalize_vec(vector);
+        let neg = negate_vec(&v);
+        Self {
+            id:          Uuid::new_v4().to_string(),
+            tags,
+            neg_vector:  neg,
+            vector:      v,
+            payload,
+            created_at:  Utc::now().timestamp(),
+            ttl_seconds: None,
+            version:     1,
+            bead_meta:   BeadMetadata { confidence: 1.0, ..Default::default() },
+        }
+    }
+
+    pub fn with_id(mut self, id: String) -> Self { self.id = id; self }
+    pub fn with_ttl(mut self, s: u64) -> Self { self.ttl_seconds = Some(s); self }
+    pub fn with_confidence(mut self, c: f32) -> Self { self.bead_meta.confidence = c; self }
+    pub fn with_source(mut self, s: impl Into<String>) -> Self { self.bead_meta.source = s.into(); self }
+    pub fn with_custom(mut self, k: impl Into<String>, v: impl Into<String>) -> Self {
+        self.bead_meta.custom.insert(k.into(), v.into()); self
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.ttl_seconds.map_or(false, |t| Utc::now().timestamp() as u64 > self.created_at as u64 + t)
+    }
+}
+
+/// 边类型 — 让共现图成为知识图谱
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum EdgeType {
+    #[default]
+    Semantic,        // 语义关联（默认）
+    Sequential,      // 时序共现（先A后B）
+    Causal,          // 因果关系（A导致B）
+    Custom(String),  // 自定义语义
+}
+
+/// 技能类型
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum SkillType { #[default] Atomic, Composite, Wasm }
+
+/// 资源限制（WASM + 技能执行安全边界）
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ResourceLimits {
+    pub max_memory_mb:   u64,
+    pub max_cpu_time_ms: u64,
+    pub max_output_kb:   u64,
+}
+
+/// 技能元数据
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SkillMetadata {
+    pub author:       String,
+    pub description:  String,
+    pub version:      String,
+    pub timeout_ms:   u64,         // 0 = 无超时
+    pub resources:    ResourceLimits,
+    pub dependencies: Vec<String>,
+}
+
+/// 传感器状态（六维力觉/力矩/触觉阵列/视觉/自定义通道）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SensorState {
+    pub position: [f32; 3],             // x, y, z (米)
+    pub force:    [f32; 3],             // Fx, Fy, Fz (牛顿)
+    pub torque:   [f32; 3],             // Tx, Ty, Tz (牛·米)
+    pub tactile:  Vec<f32>,             // 触觉压力阵列
+    pub visual:   Option<JsonValue>,    // 结构化视觉观测
+    pub extra:    HashMap<String, f32>, // 自定义传感器通道
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// § 5  向量工具 — Vector Utilities
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// HNSW堆操作用的全序f32包装（total_cmp实现确定性排序）
+#[derive(Clone, Copy, PartialEq)]
+pub struct OrdF32(pub f32);
+impl Eq for OrdF32 {}
+impl PartialOrd for OrdF32 { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
+impl Ord for OrdF32 { fn cmp(&self, o: &Self) -> Ordering { self.0.total_cmp(&o.0) } }
+
+#[inline] pub fn dot(a: &[f32], b: &[f32]) -> f32 { a.iter().zip(b).map(|(x, y)| x * y).sum() }
+#[inline] pub fn vec_norm(a: &[f32]) -> f32 { a.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6) }
+#[inline] pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let d = vec_norm(a) * vec_norm(b);
+    if d == 0.0 { 0.0 } else { dot(a, b) / d }
+}
+/// 余弦距离 = 1 - dot(a,b)。对于归一化单位向量，范围是 [0, 2]。
+/// 两向量完全相同 → 0；完全正交 → 1；完全相反 → 2。
+#[inline] pub fn cosine_dist(a: &[f32], b: &[f32]) -> f32 { 1.0 - dot(a, b) }
+
+pub fn normalize_vec(mut v: Vec<f32>) -> Vec<f32> {
+    let n = vec_norm(&v);
+    if n == 0.0 { return v; }
+    for x in &mut v { *x /= n; }
+    v
+}
+pub fn negate_vec(v: &[f32]) -> Vec<f32> { v.iter().map(|x| -*x).collect() }
+
+/// FNV-1a 64位哈希（用于确定性embedding种子）
+pub fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 14_695_981_039_346_656_037;
+    for b in s.bytes() { h ^= b as u64; h = h.wrapping_mul(1_099_511_628_211); }
+    h
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// § 6  极性共振 PolarResonance — 专用评分器
+//
+// 共振公式：score = α·cos(q, v) + ξ·cos(q, −v) + γ·co_boost
+//
+// 为什么需要 ξ？
+// 在具身智能中，"右手抓杯"和"左手抓杯"是语义互补的技能。
+// 纯余弦相似度认为它们相似（同为抓杯），但 ξ 通过对 −v 的额外加权
+// 进一步强化这种对称性：在 −v 方向高相似意味着两者互为镜像，
+// 正是侧别泛化（bilateral generalization）能力的基础。
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct PolarResonance {
+    graph: Arc<ResonanceGraph>,
+    pub alpha: f32,
+    pub xi:    f32,
+    pub gamma: f32,
+}
+
+impl PolarResonance {
+    pub fn new(graph: Arc<ResonanceGraph>, alpha: f32, xi: f32, gamma: f32) -> Self {
+        Self { graph, alpha, xi, gamma }
+    }
+
+    /// 基础共振评分（不含共现加权）
+    #[inline]
+    pub fn score(&self, q: &[f32], bead: &MemoryBead) -> f32 {
+        self.alpha * cosine_similarity(q, &bead.vector)
+            + self.xi * cosine_similarity(q, &bead.neg_vector)
+    }
+
+    /// 完整评分（含上下文共现加权 γ）
+    pub fn score_ctx(&self, q: &[f32], bead: &MemoryBead, ctx: &[String]) -> f32 {
+        let base = self.score(q, bead);
+        if self.gamma <= 0.0 || ctx.is_empty() { return base; }
+        let co: f32 = ctx.iter()
+            .flat_map(|cid| self.graph.top_neighbors(cid, 50))
+            .filter(|(nid, _)| nid == &bead.id)
+            .map(|(_, w)| w as f32)
+            .sum::<f32>()
+            .min(1.0); // 归一化到 [0, 1]
+        base + self.gamma * co
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// § 7  回声脉 EchoProvider — 确定性 / HTTP / ONNX 三实现
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[async_trait]
+pub trait EchoProvider: Send + Sync + 'static {
+    async fn embed_batch(&self, texts: &[String]) -> ZResult<Vec<Vec<f32>>>;
+
+    async fn embed(&self, text: &str) -> ZResult<Vec<f32>> {
+        self.embed_batch(&[text.to_string()]).await?
+            .pop().ok_or_else(|| ZhiHunError::Onnx("empty batch".into()))
+    }
+
+    async fn neg_embed(&self, text: &str) -> ZResult<Vec<f32>> {
+        Ok(negate_vec(&self.embed(text).await?))
+    }
+}
+
+// ─── 7a. 确定性Embedding（FNV hash → StdRng，rayon并行，测试/离线友好）────────
+
+pub struct DeterministicEcho { pub dims: usize }
+impl DeterministicEcho { pub fn new(dims: usize) -> Self { Self { dims } } }
+
+#[async_trait]
+impl EchoProvider for DeterministicEcho {
+    async fn embed_batch(&self, texts: &[String]) -> ZResult<Vec<Vec<f32>>> {
+        let dims = self.dims;
+        Ok(texts.par_iter().map(|t| {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(fnv1a(t));
+            normalize_vec((0..dims).map(|_| rng.gen_range(-1.0f32..1.0)).collect())
+        }).collect())
+    }
+}
+
+// ─── 7b. HTTP Embedding（外部服务，含 API key 支持）────────────────────────────
+
+#[derive(Serialize)]   struct HttpEmbedReq<'a> { inputs: &'a [String], dims: usize }
+#[derive(Deserialize)] struct HttpEmbedResp { embeddings: Vec<Vec<f32>> }
+
+pub struct HttpEcho {
+    endpoint: String,
+    api_key:  Option<String>,
+    dims:     usize,
+    client:   reqwest::Client,
+}
+
+impl HttpEcho {
+    pub fn new(endpoint: String, api_key: Option<String>, dims: usize) -> Self {
+        let client = reqwest::Client::builder()
+            .pool_max_idle_per_host(8)
+            .timeout(Duration::from_secs(30))
+            .build().unwrap();
+        Self { endpoint, api_key, dims, client }
+    }
+}
+
+#[async_trait]
+impl EchoProvider for HttpEcho {
+    async fn embed_batch(&self, texts: &[String]) -> ZResult<Vec<Vec<f32>>> {
+        let mut b = self.client.post(&self.endpoint)
+            .json(&HttpEmbedReq { inputs: texts, dims: self.dims });
+        if let Some(k) = &self.api_key {
+            b = b.header("Authorization", format!("Bearer {}", k));
+        }
+        let resp: HttpEmbedResp = b.send().await
+            .map_err(|e| ZhiHunError::Network(e.to_string()))?
+            .error_for_status()
+            .map_err(|e| ZhiHunError::Network(e.to_string()))?
+            .json().await
+            .map_err(|e| ZhiHunError::Network(e.to_string()))?;
+        Ok(resp.embeddings.into_iter().map(normalize_vec).collect())
+    }
+}
+
+// ─── 7c. ONNX Pipeline（Tokenizer + ONNX Runtime，GPU/CPU可选）───────────────
+
+pub struct OnnxEcho {
+    tokenizer:   Tokenizer,
+    session:     Arc<onnxruntime::session::Session>,
+    input_name:  String,
+    dims:        usize,
+}
+
+impl OnnxEcho {
+    pub fn new(model: &str, tokenizer: &str, dims: usize, cuda: bool) -> ZResult<Self> {
+        let tokenizer = Tokenizer::from_file(tokenizer)
+            .map_err(|e| ZhiHunError::Onnx(format!("tokenizer: {}", e)))?;
+        let env = OnnxEnvironment::builder()
+            .with_name("zhihun")
+            .with_log_level(LoggingLevel::Warning)
+            .build().map_err(|e| ZhiHunError::Onnx(format!("env: {:?}", e)))?;
+        let mut b = SessionBuilder::new(&env)
+            .map_err(|e| ZhiHunError::Onnx(format!("builder: {:?}", e)))?
+            .with_optimization_level(GraphOptimizationLevel::All)
+            .map_err(|e| ZhiHunError::Onnx(format!("opt: {:?}", e)))?;
+        if cuda { b = b.with_cuda(0).map_err(|e| ZhiHunError::Onnx(format!("cuda: {:?}", e)))?; }
+        let session = b.with_model_from_file(model)
+            .map_err(|e| ZhiHunError::Onnx(format!("model: {:?}", e)))?;
+        let input_name = session.inputs[0].name.clone();
+        Ok(Self { tokenizer, session: Arc::new(session), input_name, dims })
+    }
+}
+
+#[async_trait]
+impl EchoProvider for OnnxEcho {
+    async fn embed_batch(&self, texts: &[String]) -> ZResult<Vec<Vec<f32>>> {
+        let encodings: Vec<Encoding> = texts.iter()
+            .map(|t| self.tokenizer.encode(t.as_str(), true)
+                .map_err(|e| ZhiHunError::Onnx(format!("tok: {}", e))))
+            .collect::<ZResult<_>>()?;
+        let max_len: usize = encodings.iter().map(|e: &Encoding| e.get_ids().len()).max().unwrap_or(1);
+        let batch = texts.len();
+        let mut input_ids: Vec<i64> = Vec::with_capacity(batch * max_len);
+        for enc in &encodings {
+            let ids: &[u32] = enc.get_ids();
+            for &id in ids { input_ids.push(id as i64); }
+            for _   in ids.len()..max_len { input_ids.push(0); }
+        }
+        let session = self.session.clone();
+        let input_name = self.input_name.clone();
+        task::spawn_blocking(move || -> ZResult<Vec<Vec<f32>>> {
+            let ids_arr = Array::from_shape_vec((batch, max_len), input_ids)
+                .map_err(|e| ZhiHunError::Onnx(format!("shape: {}", e)))?;
+            let outputs = session.run(vec![(input_name.as_str(), NdArrayTensor::from_array(ids_arr))])
+                .map_err(|e| ZhiHunError::Onnx(format!("run: {:?}", e)))?;
+            let out = outputs.get(0).ok_or_else(|| ZhiHunError::Onnx("no output".into()))?;
+            let arr = out.try_extract::<f32>()
+                .map_err(|e| ZhiHunError::Onnx(format!("extract: {:?}", e)))?;
+            let d = arr.shape()[arr.shape().len() - 1];
+            (0..batch).map(|i| Ok(normalize_vec(arr.iter().skip(i * d).take(d).cloned().collect())))
+                .collect()
+        }).await.map_err(|e| ZhiHunError::Concurrency(e.to_string()))?
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// § 8  深渊库 AbyssStore — Sled 四树 / Postgres 双后端
+//
+// Sled 四棵树的设计思路：
+//   beads          — 主记忆珠存储（id → bincode）
+//   cooc           — 共现关系（"a|b" → (count, edge_type)）
+//   skills         — 技能织体（id → bincode）
+//   skill_name_idx — 技能名称→ID反向索引（name → id）
+//
+// skill_name_idx 带来的价值：按名称查找技能从 O(n) 降为 O(1)，
+// 删除时可以级联删除名称索引，保证一致性。
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[async_trait]
+pub trait AbyssStore: Send + Sync + 'static {
+    async fn insert_bead(&self, bead: &MemoryBead) -> ZResult<()>;
+    async fn get_bead(&self, id: &str) -> ZResult<Option<MemoryBead>>;
+    async fn delete_bead(&self, id: &str) -> ZResult<bool>;
+    async fn all_beads(&self) -> ZResult<Vec<MemoryBead>>;
+    async fn upsert_cooc(&self, a: &str, b: &str, delta: i64, et: &EdgeType) -> ZResult<()>;
+    async fn load_cooc(&self) -> ZResult<HashMap<String, HashMap<String, (i64, EdgeType)>>>;
+    async fn insert_skill_payload(&self, id: &str, name: &str, payload: &[u8]) -> ZResult<()>;
+    async fn get_skill_payload(&self, id: &str) -> ZResult<Option<Vec<u8>>>;
+    /// O(1) 技能名称查找（依赖 skill_name_idx 树）
+    async fn get_skill_id_by_name(&self, name: &str) -> ZResult<Option<String>>;
+    /// 级联删除：同时删除技能主树和名称索引
+    async fn delete_skill(&self, id: &str) -> ZResult<bool>;
+    async fn all_skill_payloads(&self) -> ZResult<Vec<(String, Vec<u8>)>>;
+    async fn flush(&self) -> ZResult<()>;
+}
+
+// ─── 8a. Sled 四树（64MB缓存 + 100ms定时刷写 + 预开句柄）─────────────────────
+
+pub struct SledAbyss {
+    db:              sled::Db,
+    beads:           sled::Tree,
+    cooc:            sled::Tree,
+    skills:          sled::Tree,
+    /// 技能名称→ID反向索引（O(1)查找）
+    skill_name_idx:  sled::Tree,
+}
+
+impl SledAbyss {
+    pub fn open(path: &str) -> ZResult<Self> {
+        let db = sled::Config::default()
+            .path(path)
+            .cache_capacity(64 * 1024 * 1024) // 64MB读缓存
+            .flush_every_ms(Some(100))          // 定时批量刷写降低IO开销
+            .open()?;
+        Ok(Self {
+            beads:          db.open_tree("beads")?,
+            cooc:           db.open_tree("cooc")?,
+            skills:         db.open_tree("skills")?,
+            skill_name_idx: db.open_tree("skill_name_idx")?,
+            db,
+        })
+    }
+}
+
+#[async_trait]
+impl AbyssStore for SledAbyss {
+    async fn insert_bead(&self, bead: &MemoryBead) -> ZResult<()> {
+        self.beads.insert(bead.id.as_bytes(), bincode::serialize(bead)?)?;
+        Ok(())
+    }
+
+    async fn get_bead(&self, id: &str) -> ZResult<Option<MemoryBead>> {
+        match self.beads.get(id.as_bytes())? {
+            Some(v) => Ok(Some(bincode::deserialize(v.as_ref())?)),
+            None    => Ok(None),
+        }
+    }
+
+    async fn delete_bead(&self, id: &str) -> ZResult<bool> {
+        Ok(self.beads.remove(id.as_bytes())?.is_some())
+    }
+
+    async fn all_beads(&self) -> ZResult<Vec<MemoryBead>> {
+        let mut out = Vec::new();
+        for kv in self.beads.iter() {
+            let (_k, v) = kv?;
+            let b: MemoryBead = bincode::deserialize(v.as_ref())?;
+            if !b.is_expired() { out.push(b); }
+        }
+        Ok(out)
+    }
+
+    async fn upsert_cooc(&self, a: &str, b: &str, delta: i64, et: &EdgeType) -> ZResult<()> {
+        let et_byte: u8 = match et {
+            EdgeType::Sequential => 0,
+            EdgeType::Semantic   => 1,
+            EdgeType::Causal     => 2,
+            EdgeType::Custom(_)  => 3,
+        };
+        for (x, y) in [(a, b), (b, a)] {
+            let key = format!("{}|{}", x, y);
+            let old: i64 = self.cooc.get(key.as_bytes())?
+                .and_then(|v: sled::IVec| v.get(0..8).map(|s: &[u8]| i64::from_be_bytes(s.try_into().unwrap_or([0; 8]))))
+                .unwrap_or(0);
+            let mut val = (old + delta).max(0).to_be_bytes().to_vec();
+            val.push(et_byte);
+            self.cooc.insert(key.as_bytes(), val)?;
+        }
+        Ok(())
+    }
+
+    async fn load_cooc(&self) -> ZResult<HashMap<String, HashMap<String, (i64, EdgeType)>>> {
+        let mut out: HashMap<String, HashMap<String, (i64, EdgeType)>> = HashMap::new();
+        for kv in self.cooc.iter() {
+            let (k, v) = kv?;
+            if v.len() < 8 { continue; }
+            let key = String::from_utf8_lossy(k.as_ref()).to_string();
+            let cnt = i64::from_be_bytes(v[..8].try_into().unwrap_or([0; 8]));
+            let et  = match v.get(8).copied().unwrap_or(1) {
+                0 => EdgeType::Sequential,
+                2 => EdgeType::Causal,
+                3 => EdgeType::Custom("custom".into()),
+                _ => EdgeType::Semantic,
+            };
+            if let Some((a, b)) = key.split_once('|') {
+                out.entry(a.to_string()).or_default().insert(b.to_string(), (cnt, et));
+            }
+        }
+        Ok(out)
+    }
+
+    async fn insert_skill_payload(&self, id: &str, name: &str, payload: &[u8]) -> ZResult<()> {
+        self.skills.insert(id.as_bytes(), payload)?;
+        // 同步写入名称索引
+        self.skill_name_idx.insert(name.as_bytes(), id.as_bytes())?;
+        Ok(())
+    }
+
+    async fn get_skill_payload(&self, id: &str) -> ZResult<Option<Vec<u8>>> {
+        Ok(self.skills.get(id.as_bytes())?.map(|v: sled::IVec| v.to_vec()))
+    }
+
+    async fn get_skill_id_by_name(&self, name: &str) -> ZResult<Option<String>> {
+        Ok(self.skill_name_idx.get(name.as_bytes())?
+            .map(|v: sled::IVec| String::from_utf8_lossy(v.as_ref()).to_string()))
+    }
+
+    async fn delete_skill(&self, id: &str) -> ZResult<bool> {
+        // 先读取名称，再级联删除名称索引
+        if let Some(payload) = self.skills.remove(id.as_bytes())? {
+            if let Ok(weave) = bincode::deserialize::<SkillWeave>(payload.as_ref()) {
+                self.skill_name_idx.remove(weave.name.as_bytes())?;
+            }
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn all_skill_payloads(&self) -> ZResult<Vec<(String, Vec<u8>)>> {
+        let mut out = Vec::new();
+        for kv in self.skills.iter() {
+            let (k, v) = kv?;
+            out.push((String::from_utf8_lossy(k.as_ref()).to_string(), v.to_vec()));
+        }
+        Ok(out)
+    }
+
+    async fn flush(&self) -> ZResult<()> { self.db.flush()?; Ok(()) }
+}
+
+// ─── 8b. Postgres + pgvector ──────────────────────────────────────────────────
+
+pub struct PostgresAbyss { pool: PgPool }
+
+impl PostgresAbyss {
+    pub async fn new(url: &str) -> ZResult<Self> {
+        let pool = PgPoolOptions::new().max_connections(16).connect(url).await?;
+        Ok(Self { pool })
+    }
+
+    pub async fn init_schema(&self) -> ZResult<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("CREATE EXTENSION IF NOT EXISTS vector;").execute(&mut *tx).await?;
+        sqlx::query(r#"
+            CREATE TABLE IF NOT EXISTS zhihun_beads (
+                id TEXT PRIMARY KEY, tags JSONB NOT NULL DEFAULT '[]',
+                vector vector, neg_vector vector,
+                payload JSONB, bead_meta JSONB,
+                created_at BIGINT NOT NULL, ttl_secs BIGINT, version INT NOT NULL DEFAULT 1
+            );
+            CREATE INDEX IF NOT EXISTS idx_zb_vec ON zhihun_beads
+                USING ivfflat (vector vector_cosine_ops) WITH (lists = 100);
+            CREATE TABLE IF NOT EXISTS zhihun_cooc (
+                a TEXT NOT NULL, b TEXT NOT NULL,
+                cnt BIGINT NOT NULL DEFAULT 0, last_seen BIGINT,
+                edge_type TEXT NOT NULL DEFAULT 'semantic',
+                PRIMARY KEY (a, b)
+            );
+            CREATE TABLE IF NOT EXISTS zhihun_skills (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, payload BYTEA
+            );
+        "#).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl AbyssStore for PostgresAbyss {
+    async fn insert_bead(&self, b: &MemoryBead) -> ZResult<()> {
+        let tags = serde_json::to_value(&b.tags)?;
+        let meta = serde_json::to_value(&b.bead_meta)?;
+        let vec     = PgVector::from(b.vector.clone());
+        let neg_vec = PgVector::from(b.neg_vector.clone());
+        sqlx::query!(
+            r#"INSERT INTO zhihun_beads(id,tags,vector,neg_vector,payload,bead_meta,created_at,ttl_secs,version)
+               VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+               ON CONFLICT(id) DO UPDATE SET
+                 tags=EXCLUDED.tags, vector=EXCLUDED.vector, neg_vector=EXCLUDED.neg_vector,
+                 payload=EXCLUDED.payload, bead_meta=EXCLUDED.bead_meta,
+                 created_at=EXCLUDED.created_at, ttl_secs=EXCLUDED.ttl_secs, version=EXCLUDED.version"#,
+            b.id, tags, vec as PgVector, neg_vec as PgVector,
+            b.payload, meta, b.created_at, b.ttl_seconds.map(|t| t as i64), b.version as i32
+        ).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn get_bead(&self, id: &str) -> ZResult<Option<MemoryBead>> {
+        let row = sqlx::query!(
+            r#"SELECT id,tags,vector as "vector: PgVector",neg_vector as "neg_vector: PgVector",
+                      payload,bead_meta,created_at,ttl_secs,version
+               FROM zhihun_beads WHERE id=$1"#,
+            id
+        ).fetch_optional(&self.pool).await?;
+        Ok(row.map(|r| {
+            let tags: Vec<String> = serde_json::from_value(r.tags.unwrap_or(JsonValue::Null)).unwrap_or_default();
+            let bead_meta: BeadMetadata = serde_json::from_value(r.bead_meta.unwrap_or(JsonValue::Null)).unwrap_or_default();
+            MemoryBead {
+                id: r.id, tags,
+                vector:      r.vector.map(|v: PgVector| v.to_vec()).unwrap_or_default(),
+                neg_vector:  r.neg_vector.map(|v: PgVector| v.to_vec()).unwrap_or_default(),
+                payload:     r.payload.unwrap_or(JsonValue::Null),
+                bead_meta,
+                created_at:  r.created_at,
+                ttl_seconds: r.ttl_secs.map(|t| t as u64),
+                version:     r.version as u32,
+            }
+        }))
+    }
+
+    async fn delete_bead(&self, id: &str) -> ZResult<bool> {
+        let r = sqlx::query!("DELETE FROM zhihun_beads WHERE id=$1", id)
+            .execute(&self.pool).await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    async fn all_beads(&self) -> ZResult<Vec<MemoryBead>> {
+        let rows = sqlx::query!(
+            r#"SELECT id,tags,vector as "vector: PgVector",neg_vector as "neg_vector: PgVector",
+                      payload,bead_meta,created_at,ttl_secs,version FROM zhihun_beads"#
+        ).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().filter_map(|r| {
+            let tags: Vec<String> = serde_json::from_value(r.tags.unwrap_or(JsonValue::Null)).unwrap_or_default();
+            let bead_meta: BeadMetadata = serde_json::from_value(r.bead_meta.unwrap_or(JsonValue::Null)).unwrap_or_default();
+            let b = MemoryBead {
+                id: r.id, tags,
+                vector:      r.vector.map(|v: PgVector| v.to_vec()).unwrap_or_default(),
+                neg_vector:  r.neg_vector.map(|v: PgVector| v.to_vec()).unwrap_or_default(),
+                payload:     r.payload.unwrap_or(JsonValue::Null),
+                bead_meta,
+                created_at:  r.created_at,
+                ttl_seconds: r.ttl_secs.map(|t| t as u64),
+                version:     r.version as u32,
+            };
+            if b.is_expired() { None } else { Some(b) }
+        }).collect())
+    }
+
+    async fn upsert_cooc(&self, a: &str, b: &str, delta: i64, et: &EdgeType) -> ZResult<()> {
+        let now = Utc::now().timestamp();
+        let et_str = match et {
+            EdgeType::Sequential => "sequential",
+            EdgeType::Semantic   => "semantic",
+            EdgeType::Causal     => "causal",
+            EdgeType::Custom(s)  => s.as_str(),
+        };
+        let mut tx = self.pool.begin().await?;
+        for (x, y) in [(a, b), (b, a)] {
+            sqlx::query!(
+                r#"INSERT INTO zhihun_cooc(a,b,cnt,last_seen,edge_type) VALUES($1,$2,$3,$4,$5)
+                   ON CONFLICT(a,b) DO UPDATE SET cnt=zhihun_cooc.cnt+$3,last_seen=$4,edge_type=$5"#,
+                x, y, delta, now, et_str
+            ).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn load_cooc(&self) -> ZResult<HashMap<String, HashMap<String, (i64, EdgeType)>>> {
+        let rows = sqlx::query!("SELECT a,b,cnt,edge_type FROM zhihun_cooc")
+            .fetch_all(&self.pool).await?;
+        let mut out: HashMap<String, HashMap<String, (i64, EdgeType)>> = HashMap::new();
+        for r in rows {
+            let et = match r.edge_type.as_deref().unwrap_or("semantic") {
+                "sequential" => EdgeType::Sequential,
+                "causal"     => EdgeType::Causal,
+                s if s != "semantic" => EdgeType::Custom(s.to_string()),
+                _            => EdgeType::Semantic,
+            };
+            out.entry(r.a).or_default().insert(r.b, (r.cnt.unwrap_or(0), et));
+        }
+        Ok(out)
+    }
+
+    async fn insert_skill_payload(&self, id: &str, name: &str, payload: &[u8]) -> ZResult<()> {
+        sqlx::query!(
+            "INSERT INTO zhihun_skills(id,name,payload) VALUES($1,$2,$3)
+             ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name, payload=EXCLUDED.payload",
+            id, name, payload
+        ).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn get_skill_payload(&self, id: &str) -> ZResult<Option<Vec<u8>>> {
+        let r = sqlx::query!("SELECT payload FROM zhihun_skills WHERE id=$1", id)
+            .fetch_optional(&self.pool).await?;
+        Ok(r.and_then(|r| r.payload))
+    }
+
+    async fn get_skill_id_by_name(&self, name: &str) -> ZResult<Option<String>> {
+        let r = sqlx::query!("SELECT id FROM zhihun_skills WHERE name=$1", name)
+            .fetch_optional(&self.pool).await?;
+        Ok(r.map(|r| r.id))
+    }
+
+    async fn delete_skill(&self, id: &str) -> ZResult<bool> {
+        let r = sqlx::query!("DELETE FROM zhihun_skills WHERE id=$1", id)
+            .execute(&self.pool).await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    async fn all_skill_payloads(&self) -> ZResult<Vec<(String, Vec<u8>)>> {
+        let rows = sqlx::query!("SELECT id, payload FROM zhihun_skills")
+            .fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().filter_map(|r| r.payload.map(|p| (r.id, p))).collect())
+    }
+
+    async fn flush(&self) -> ZResult<()> { Ok(()) }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// § 9  星帆 StarSailManager — 自研HNSW + 零停机版本管理
+//
+// HnswInner 基于 Malkov & Yashunin 2018 (arXiv:1603.09320)。
+// 核心思想：多层稀疏图，顶层少边快速定位，底层多边精确搜索。
+// 几何级随机分层：level ~ floor(-ln(U) / ln(m))
+// 这个设计使得插入和搜索的期望复杂度都是 O(log n)。
+//
+// 为什么自研而不用外部crate？
+// 完全控制算法细节；可以在单位向量假设下用
+// 余弦距离 = 1 - dot(a,b) 替换通用距离，避免两次 norm 计算；
+// 可以在未来集成硬件感知的 SIMD 加速。
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// HNSW 节点（保存向量 + 每层邻居列表）
+#[derive(Serialize, Deserialize, Clone)]
+struct HnswNode {
+    label:  usize,
+    vector: Vec<f32>,
+    /// layers[l] = 该节点在第 l 层的邻居索引列表（按距离升序）
+    layers: Vec<Vec<usize>>,
+}
+
+/// HNSW 核心算法（从零实现，无外部依赖）
+#[derive(Serialize, Deserialize)]
+struct HnswInner {
+    nodes:       Vec<HnswNode>,
+    entry_point: Option<usize>,
+    max_layer:   usize,
+    dim:         usize,
+    m:           usize,   // 每层最大连接数
+    m0:          usize,   // 第0层最大连接数 = 2*m
+    ef_const:    usize,   // 构建时候选集大小
+    ml:          f64,     // 分层概率参数 = 1/ln(m)
+}
+
+impl HnswInner {
+    fn new(dim: usize, m: usize, ef_construction: usize) -> Self {
+        // ml = 1/ln(m)，这是 Malkov & Yashunin 论文中的归一化因子
+        let ml = 1.0 / (m as f64).ln().max(1e-10);
+        Self {
+            nodes: Vec::new(), entry_point: None, max_layer: 0,
+            dim, m, m0: m * 2, ef_const: ef_construction, ml,
+        }
+    }
+
+    /// 余弦距离（单位向量）= 1 - dot(a, b)，范围 [0, 2]
+    #[inline]
+    fn dist(a: &[f32], b: &[f32]) -> f32 { 1.0 - dot(a, b) }
+
+    /// 在单层做贪心 beam search
+    /// ep_set: 入口节点集；ef: 结果集大小（ef_construction 或 ef_search）
+    /// 返回 (distance, node_index) 列表，按距离升序
+    fn search_layer(&self, query: &[f32], ep_set: &[usize], ef: usize, layer: usize) -> Vec<(f32, usize)> {
+        let mut visited: HashSet<usize> = ep_set.iter().copied().collect();
+        // 候选集（min-heap：距离最小的最先弹出，用于扩展）
+        let mut candidates: BinaryHeap<Reverse<(OrdF32, usize)>> = ep_set.iter()
+            .map(|&ep| Reverse((OrdF32(Self::dist(query, &self.nodes[ep].vector)), ep)))
+            .collect();
+        // 结果集 W（max-heap：距离最大的在堆顶，方便驱逐最差结果）
+        let mut w: BinaryHeap<(OrdF32, usize)> = ep_set.iter()
+            .map(|&ep| (OrdF32(Self::dist(query, &self.nodes[ep].vector)), ep))
+            .collect();
+
+        while let Some(Reverse((OrdF32(c_dist), c_idx))) = candidates.pop() {
+            // 若最近候选比结果集最远元素还远，停止扩展
+            if let Some(&(OrdF32(f_dist), _)) = w.peek() {
+                if c_dist > f_dist && w.len() >= ef { break; }
+            }
+            // 遍历当前节点在该层的邻居
+            let nbrs = self.nodes[c_idx].layers.get(layer).cloned().unwrap_or_default();
+            for e in nbrs {
+                if visited.contains(&e) { continue; }
+                visited.insert(e);
+                let e_dist = Self::dist(query, &self.nodes[e].vector);
+                let worst  = w.peek().map_or(f32::MAX, |&(OrdF32(d), _)| d);
+                if e_dist < worst || w.len() < ef {
+                    candidates.push(Reverse((OrdF32(e_dist), e)));
+                    w.push((OrdF32(e_dist), e));
+                    if w.len() > ef { w.pop(); } // 驱逐最差结果
+                }
+            }
+        }
+
+        let mut result: Vec<(f32, usize)> = w.into_iter().map(|(OrdF32(d), i)| (d, i)).collect();
+        result.sort_by(|a, b| a.0.total_cmp(&b.0));
+        result
+    }
+
+    /// 简单邻居选择（贪心：取最近的 M 个）
+    fn select_neighbors(candidates: &[(f32, usize)], m: usize) -> Vec<usize> {
+        candidates.iter().take(m).map(|&(_, i)| i).collect()
+    }
+
+    /// 随机层级（几何分布）：P(level = l) ≈ exp(-l / ml)
+    fn random_level(&self) -> usize {
+        let u: f64 = rand::thread_rng().gen::<f64>().max(1e-10);
+        ((-u.ln() * self.ml).floor() as usize).min(16) // 最高16层，防止内存爆炸
+    }
+
+    pub fn insert(&mut self, label: usize, vector: Vec<f32>) -> ZResult<()> {
+        if vector.len() != self.dim {
+            return Err(ZhiHunError::DimMismatch { expected: self.dim, actual: vector.len() });
+        }
+        let l       = self.random_level();
+        let new_idx = self.nodes.len();
+        self.nodes.push(HnswNode { label, vector: vector.clone(), layers: vec![Vec::new(); l + 1] });
+
+        let Some(mut ep) = self.entry_point else {
+            // 第一个节点：直接设为入口点
+            self.entry_point = Some(new_idx);
+            self.max_layer   = l;
+            return Ok(());
+        };
+
+        let max_l = self.max_layer;
+
+        // 从顶层贪心下降到 l+1（单点ef=1快速定位）
+        for lc in ((l + 1)..=max_l).rev() {
+            let w = self.search_layer(&vector, &[ep], 1, lc);
+            ep = w.first().map_or(ep, |&(_, i)| i);
+        }
+
+        // 在 min(l, max_l)..=0 各层找邻居并建立双向连接
+        let mut eps = vec![ep];
+        for lc in (0..=l.min(max_l)).rev() {
+            let m_lc       = if lc == 0 { self.m0 } else { self.m };
+            let candidates = self.search_layer(&vector, &eps, self.ef_const, lc);
+            let neighbors  = Self::select_neighbors(&candidates, m_lc);
+
+            // 设置新节点在该层的邻居列表
+            if let Some(node) = self.nodes.get_mut(new_idx) {
+                if lc < node.layers.len() { node.layers[lc] = neighbors.clone(); }
+            }
+
+            // 建立双向连接（超容量时剪枝，保留最近的 M 个）
+            for &nb in &neighbors {
+                let nb_max = if lc == 0 { self.m0 } else { self.m };
+                if lc < self.nodes[nb].layers.len() {
+                    self.nodes[nb].layers[lc].push(new_idx);
+                    if self.nodes[nb].layers[lc].len() > nb_max {
+                        // 剪枝：重新排序保留最近的 nb_max 个
+                        let nb_vec = self.nodes[nb].vector.clone();
+                        let mut sc: Vec<(f32, usize)> = self.nodes[nb].layers[lc].iter()
+                            .map(|&i| (Self::dist(&nb_vec, &self.nodes[i].vector), i))
+                            .collect();
+                        sc.sort_by(|a, b| a.0.total_cmp(&b.0));
+                        sc.truncate(nb_max);
+                        self.nodes[nb].layers[lc] = sc.into_iter().map(|(_, i)| i).collect();
+                    }
+                }
+            }
+            eps = candidates.iter().map(|&(_, i)| i).collect();
+        }
+
+        // 若新节点层级更高，更新入口点
+        if l > max_l { self.entry_point = Some(new_idx); self.max_layer = l; }
+        Ok(())
+    }
+
+    pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(usize, f32)> {
+        let Some(mut ep) = self.entry_point else { return vec![]; };
+        // 从顶层贪心下降到第1层（定位）
+        for lc in (1..=self.max_layer).rev() {
+            let w = self.search_layer(query, &[ep], 1, lc);
+            ep = w.first().map_or(ep, |&(_, i)| i);
+        }
+        // 在第0层做完整 beam search（精确检索）
+        self.search_layer(query, &[ep], ef.max(k), 0)
+            .into_iter().take(k)
+            .map(|(d, i)| (self.nodes[i].label, d))
+            .collect()
+    }
+
+    pub fn len(&self) -> usize { self.nodes.len() }
+}
+
+/// 线程安全 HNSW 包装（持久化 + 批量插入）
+pub struct StarSailIndex {
+    inner:      RwLock<HnswInner>,
+    index_path: String,
+}
+
+impl StarSailIndex {
+    pub fn new(dim: usize, path: &str, m: usize, ef: usize) -> ZResult<Self> {
+        Ok(Self { inner: RwLock::new(HnswInner::new(dim, m, ef)), index_path: path.to_string() })
+    }
+
+    pub fn load_or_create(dim: usize, path: &str, m: usize, ef: usize) -> ZResult<Self> {
+        if Path::new(path).exists() {
+            let bytes = fs::read(path)?;
+            let inner: HnswInner = bincode::deserialize(&bytes)
+                .map_err(|e| ZhiHunError::Index(format!("deser: {}", e)))?;
+            Ok(Self { inner: RwLock::new(inner), index_path: path.to_string() })
+        } else {
+            Self::new(dim, path, m, ef)
+        }
+    }
+
+    pub fn insert(&self, label: usize, v: Vec<f32>) -> ZResult<()> {
+        self.inner.write().insert(label, v)
+    }
+
+    /// rayon 并行归一化 → 顺序插入（HNSW内部不支持并发写）
+    pub fn batch_insert(&self, items: Vec<(usize, Vec<f32>)>) -> ZResult<()> {
+        let normalized: Vec<(usize, Vec<f32>)> = items.into_par_iter()
+            .map(|(l, v)| (l, normalize_vec(v))).collect();
+        let mut inner = self.inner.write();
+        for (l, v) in normalized { inner.insert(l, v)?; }
+        Ok(())
+    }
+
+    pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(usize, f32)> {
+        self.inner.read().search(query, k, ef)
+    }
+
+    pub fn persist(&self) -> ZResult<()> {
+        let bytes = bincode::serialize(&*self.inner.read())
+            .map_err(|e| ZhiHunError::Index(format!("ser: {}", e)))?;
+        fs::write(&self.index_path, bytes).map_err(|e| ZhiHunError::Io(e.to_string()))
+    }
+
+    pub fn node_count(&self) -> usize { self.inner.read().len() }
+}
+
+/// 索引版本记录
+#[derive(Debug, Clone)]
+struct IndexVersion {
+    version:    u64,
+    path:       String,
+    bead_count: usize,
+    created_at: DateTime<Utc>,
+}
+
+/// 星帆管理器（零停机版本切换 + 后台并行重建）
+pub struct StarSailManager {
+    active:    RwLock<Arc<StarSailIndex>>,
+    index_dir: PathBuf,
+    dim:       usize,
+    m:         usize,
+    ef:        usize,
+    versions:  RwLock<Vec<IndexVersion>>,
+    start_time:Instant,
+}
+
+impl StarSailManager {
+    pub fn new(dir: PathBuf, dim: usize, m: usize, ef: usize) -> ZResult<Self> {
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("hnsw_initial.bin");
+        let idx  = Arc::new(StarSailIndex::load_or_create(dim, path.to_str().unwrap(), m, ef)?);
+        let v0   = IndexVersion { version: 1, path: path.to_str().unwrap().into(), bead_count: 0, created_at: Utc::now() };
+        Ok(Self {
+            active: RwLock::new(idx), index_dir: dir, dim, m, ef,
+            versions: RwLock::new(vec![v0]),
+            start_time: Instant::now(),
+        })
+    }
+
+    pub fn insert(&self, label: usize, v: Vec<f32>) -> ZResult<()> { self.active.read().insert(label, v) }
+    pub fn search(&self, q: &[f32], k: usize, ef: usize) -> Vec<(usize, f32)> { self.active.read().search(q, k, ef) }
+    pub fn persist(&self) -> ZResult<()> { self.active.read().persist() }
+    pub fn node_count(&self) -> usize { self.active.read().node_count() }
+    pub fn uptime(&self) -> u64 { self.start_time.elapsed().as_secs() }
+
+    /// 后台并行重建索引，构建完成后原子替换活跃索引（零停机）
+    pub async fn rebuild_background(
+        self:    Arc<Self>,
+        storage: Arc<dyn AbyssStore>,
+        tag:     String,
+    ) -> ZResult<String> {
+        let mgr = self.clone();
+        task::spawn_blocking(move || -> ZResult<String> {
+            let new_path = mgr.index_dir.join(format!("hnsw_{}.bin", tag));
+            let new_idx  = StarSailIndex::new(mgr.dim, new_path.to_str().unwrap(), mgr.m, mgr.ef)?;
+            let beads = tokio::runtime::Handle::current()
+                .block_on(storage.all_beads())
+                .map_err(|e| ZhiHunError::Other(format!("load beads: {}", e)))?;
+            let n = beads.len();
+            // 并行归一化 + 批量插入
+            new_idx.batch_insert(beads.into_iter().enumerate().map(|(i, b)| (i, b.vector.clone())).collect())?;
+            new_idx.persist()?;
+            let path_str = new_path.to_str().unwrap().to_string();
+            // 原子切换（零停机：旧索引的 Arc 持有者继续工作直到 drop）
+            *mgr.active.write() = Arc::new(new_idx);
+            let ver_num = mgr.versions.read().len() as u64 + 1;
+            mgr.versions.write().push(IndexVersion {
+                version: ver_num, path: path_str.clone(), bead_count: n, created_at: Utc::now(),
+            });
+            info!("星帆: 索引已切换至版本 {} ({}条)", ver_num, n);
+            Ok(path_str)
+        }).await.map_err(|e| ZhiHunError::Concurrency(e.to_string()))?
+    }
+
+    pub fn force_switch(&self, path: &str) -> ZResult<()> {
+        let idx = StarSailIndex::load_or_create(self.dim, path, self.m, self.ef)?;
+        *self.active.write() = Arc::new(idx);
+        info!("星帆: 强制切换到 {}", path);
+        Ok(())
+    }
+
+    pub fn list_versions(&self) -> Vec<(u64, String, usize)> {
+        self.versions.read().iter().map(|v| (v.version, v.path.clone(), v.bead_count)).collect()
+    }
+
+    /// 只保留最近 keep 个版本，删除旧文件
+    pub fn cleanup_old_versions(&self, keep: usize) {
+        let mut vs = self.versions.write();
+        let n = vs.len();
+        if n <= keep { return; }
+        let to_remove: Vec<IndexVersion> = vs.drain(..(n - keep)).collect();
+        for v in to_remove { let _ = fs::remove_file(&v.path); }
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// § 10  共鸣图 ResonanceGraph — 时间衰减 + EdgeType + k-hop + PageRank
+// ═══════════════════════════════════════════════════════════════════════════════
+
+type AdjVal = (i64, i64, EdgeType); // (count, last_seen_ts, edge_type)
+
+pub struct ResonanceGraph {
+    adj:            RwLock<HashMap<String, HashMap<String, AdjVal>>>,
+    half_life_secs: i64,
+}
+
+impl ResonanceGraph {
+    pub fn new(half_life_secs: i64) -> Self {
+        Self { adj: RwLock::new(HashMap::new()), half_life_secs }
+    }
+
+    pub fn upsert(&self, a: &str, b: &str, delta: i64, et: EdgeType) {
+        if a == b { return; }
+        let now = Utc::now().timestamp();
+        let mut adj = self.adj.write();
+        for (x, y) in [(a, b), (b, a)] {
+            let e = adj.entry(x.to_string()).or_default()
+                .entry(y.to_string()).or_insert((0, now, et.clone()));
+            e.0 += delta; e.1 = now;
+        }
+    }
+
+    /// 时间衰减权重：weight = cnt * 2^(-(now - last_seen) / half_life)
+    fn decayed(&self, cnt: i64, last: i64) -> f64 {
+        let age  = (Utc::now().timestamp() - last).max(0) as f64;
+        let half = self.half_life_secs.max(1) as f64;
+        (cnt as f64) * (-(age / half) * std::f64::consts::LN_2).exp()
+    }
+
+    pub fn top_neighbors(&self, id: &str, k: usize) -> Vec<(String, f64)> {
+        let adj = self.adj.read();
+        match adj.get(id) {
+            None => vec![],
+            Some(m) => {
+                let mut v: Vec<(String, f64)> = m.iter()
+                    .map(|(nid, (cnt, last, _))| (nid.clone(), self.decayed(*cnt, *last)))
+                    .collect();
+                v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+                v.truncate(k); v
+            }
+        }
+    }
+
+    /// 按边类型过滤的邻居查询（因果链/时序链等场景使用）
+    pub fn neighbors_by_type(&self, id: &str, k: usize, et: &EdgeType) -> Vec<(String, f64)> {
+        let adj = self.adj.read();
+        match adj.get(id) {
+            None => vec![],
+            Some(m) => {
+                let mut v: Vec<(String, f64)> = m.iter()
+                    .filter(|(_, (_, _, e))| e == et)
+                    .map(|(nid, (cnt, last, _))| (nid.clone(), self.decayed(*cnt, *last)))
+                    .collect();
+                v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+                v.truncate(k); v
+            }
+        }
+    }
+
+    /// k-hop BFS 邻居（不含起点自身）
+    pub fn k_hop(&self, id: &str, k: usize) -> HashSet<String> {
+        let adj = self.adj.read();
+        let mut visited = HashSet::new();
+        let mut frontier = vec![id.to_string()];
+        for _ in 0..k {
+            let mut next = Vec::new();
+            for node in &frontier {
+                if let Some(nbrs) = adj.get(node) {
+                    for nid in nbrs.keys() {
+                        if !visited.contains(nid) && nid != id {
+                            visited.insert(nid.clone()); next.push(nid.clone());
+                        }
+                    }
+                }
+            }
+            frontier = next;
+            if frontier.is_empty() { break; }
+        }
+        visited
+    }
+
+    /// Personalized PageRank（Power Iteration，α=0.85，20轮）
+    /// 以 seed 节点为概率源，沿衰减加权边向外扩散
+    pub fn pagerank(&self, seed: &str, k: usize) -> Vec<(String, f64)> {
+        let adj   = self.adj.read();
+        let nodes: Vec<String> = adj.keys().cloned().collect();
+        if nodes.is_empty() { return vec![]; }
+        let n  = nodes.len();
+        let ni: HashMap<&str, usize> = nodes.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
+        let alpha = 0.85f64;
+        let mut rank = vec![0.0f64; n];
+        if let Some(&i) = ni.get(seed) { rank[i] = 1.0; }
+        for _ in 0..20 {
+            let mut nr = vec![(1.0 - alpha) / n as f64; n];
+            for (nd, nbrs) in adj.iter() {
+                let Some(&ni_) = ni.get(nd.as_str()) else { continue; };
+                let total: f64 = nbrs.values().map(|(c, l, _)| self.decayed(*c, *l)).sum();
+                if total <= 0.0 { continue; }
+                for (nid, (cnt, last, _)) in nbrs {
+                    if let Some(&nj) = ni.get(nid.as_str()) {
+                        nr[nj] += alpha * rank[ni_] * self.decayed(*cnt, *last) / total;
+                    }
+                }
+            }
+            rank = nr;
+        }
+        let mut sc: Vec<(String, f64)> = nodes.iter().enumerate()
+            .filter(|(_, id)| id.as_str() != seed)
+            .map(|(i, id)| (id.clone(), rank[i])).collect();
+        sc.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        sc.truncate(k); sc
+    }
+
+    pub fn stats(&self) -> GraphStats {
+        let adj = self.adj.read();
+        let node_count = adj.len();
+        let edge_count = adj.values().map(|m| m.len()).sum();
+        let avg_degree = if node_count == 0 { 0.0 } else { edge_count as f64 / node_count as f64 };
+        let max_degree = adj.values().map(|m| m.len()).max().unwrap_or(0);
+        GraphStats { node_count, edge_count, avg_degree, max_degree }
+    }
+
+    pub fn load_from_map(&self, map: HashMap<String, HashMap<String, (i64, EdgeType)>>) {
+        let now = Utc::now().timestamp();
+        let mut adj = self.adj.write();
+        for (a, nbrs) in map {
+            for (b, (cnt, et)) in nbrs {
+                adj.entry(a.clone()).or_default().insert(b, (cnt, now, et));
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// § 11  层界缓存 TieredCache — hot/warm/cold（含命中率统计）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+struct HotLayer {
+    map:       HashMap<String, MemoryBead>,
+    lru:       VecDeque<String>,
+    capacity:  usize,
+    hits:      Arc<AtomicU64>,
+    misses:    Arc<AtomicU64>,
+}
+
+impl HotLayer {
+    fn new(capacity: usize, hits: Arc<AtomicU64>, misses: Arc<AtomicU64>) -> Self {
+        Self { map: HashMap::new(), lru: VecDeque::new(), capacity, hits, misses }
+    }
+
+    fn insert(&mut self, bead: MemoryBead) {
+        let id = bead.id.clone();
+        if self.map.contains_key(&id) { self.lru.retain(|x| x != &id); }
+        self.map.insert(id.clone(), bead);
+        self.lru.push_back(id);
+        while self.lru.len() > self.capacity {
+            if let Some(e) = self.lru.pop_front() { self.map.remove(&e); }
+        }
+    }
+
+    fn get(&mut self, id: &str) -> Option<MemoryBead> {
+        if let Some(b) = self.map.get_mut(id) {
+            b.bead_meta.touch(); // 访问计数+1，更新最后访问时间
+            self.lru.retain(|x| x.as_str() != id);
+            self.lru.push_back(id.to_string());
+            self.hits.fetch_add(1, AtomicOrd::Relaxed);
+            Some(b.clone())
+        } else {
+            self.misses.fetch_add(1, AtomicOrd::Relaxed);
+            None
+        }
+    }
+
+    fn remove(&mut self, id: &str) { self.lru.retain(|x| x.as_str() != id); self.map.remove(id); }
+    fn size(&self) -> usize { self.map.len() }
+    fn all(&self) -> Vec<MemoryBead> { self.map.values().cloned().collect() }
+}
+
+pub struct WarmLayer { db: RocksDB }
+
+impl WarmLayer {
+    pub fn open(path: &str) -> ZResult<Self> {
+        let mut opts = RocksOptions::default();
+        opts.create_if_missing(true);
+        opts.set_compression_type(DBCompressionType::Lz4);
+        opts.set_write_buffer_size(64 * 1024 * 1024); // 64MB写缓冲
+        Ok(Self { db: RocksDB::open(&opts, path).map_err(|e: rocksdb::Error| ZhiHunError::Storage(e.to_string()))? })
+    }
+
+    pub fn put(&self, b: &MemoryBead) -> ZResult<()> {
+        self.db.put(b.id.as_bytes(), bincode::serialize(b)?)
+            .map_err(|e: rocksdb::Error| ZhiHunError::Storage(e.to_string()))
+    }
+
+    pub fn get(&self, id: &str) -> ZResult<Option<MemoryBead>> {
+        match self.db.get(id.as_bytes()).map_err(|e: rocksdb::Error| ZhiHunError::Storage(e.to_string()))? {
+            None    => Ok(None),
+            Some(v) => Ok(Some(bincode::deserialize(v.as_ref())?)),
+        }
+    }
+
+    pub fn delete(&self, id: &str) -> ZResult<()> {
+        self.db.delete(id.as_bytes()).map_err(|e: rocksdb::Error| ZhiHunError::Storage(e.to_string()))
+    }
+
+    pub fn size(&self) -> usize {
+        self.db.iterator(IteratorMode::Start).count()
+    }
+}
+
+pub struct TieredCache {
+    hot:       RwLock<HotLayer>,
+    warm:      Option<Arc<WarmLayer>>,
+    cold:      Arc<dyn AbyssStore>,
+    hot_hits:  Arc<AtomicU64>,
+    hot_miss:  Arc<AtomicU64>,
+    warm_hits: Arc<AtomicU64>,
+    cold_miss: Arc<AtomicU64>,
+}
+
+impl TieredCache {
+    pub fn new(cold: Arc<dyn AbyssStore>, warm: Option<Arc<WarmLayer>>, capacity: usize) -> Self {
+        let hot_hits = Arc::new(AtomicU64::new(0));
+        let hot_miss = Arc::new(AtomicU64::new(0));
+        Self {
+            hot:  RwLock::new(HotLayer::new(capacity, hot_hits.clone(), hot_miss.clone())),
+            warm, cold,
+            hot_hits, hot_miss,
+            warm_hits: Arc::new(AtomicU64::new(0)),
+            cold_miss: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub async fn insert(&self, bead: MemoryBead) -> ZResult<()> {
+        self.cold.insert_bead(&bead).await?;
+        if let Some(w) = &self.warm { let _ = w.put(&bead); }
+        self.hot.write().insert(bead);
+        Ok(())
+    }
+
+    pub async fn get(&self, id: &str) -> ZResult<Option<MemoryBead>> {
+        // 热层命中（O(1)，最常访问路径）
+        { let mut h = self.hot.write(); if let Some(b) = h.get(id) { return Ok(Some(b)); } }
+        // 温层（RocksDB）回填
+        if let Some(w) = &self.warm {
+            if let Some(b) = w.get(id)? {
+                if !b.is_expired() {
+                    self.warm_hits.fetch_add(1, AtomicOrd::Relaxed);
+                    self.hot.write().insert(b.clone());
+                    return Ok(Some(b));
+                }
+            }
+        }
+        // 冷层（Postgres/Sled）回填
+        match self.cold.get_bead(id).await? {
+            None => { self.cold_miss.fetch_add(1, AtomicOrd::Relaxed); Ok(None) }
+            Some(b) => {
+                if b.is_expired() { return Ok(None); }
+                if let Some(w) = &self.warm { let _ = w.put(&b); }
+                self.hot.write().insert(b.clone());
+                Ok(Some(b))
+            }
+        }
+    }
+
+    pub async fn delete(&self, id: &str) -> ZResult<()> {
+        self.hot.write().remove(id);
+        if let Some(w) = &self.warm { let _ = w.delete(id); }
+        self.cold.delete_bead(id).await?;
+        Ok(())
+    }
+
+    pub fn hot_size(&self)    -> usize { self.hot.read().size() }
+    pub fn hot_entries(&self) -> Vec<MemoryBead> { self.hot.read().all() }
+
+    pub fn stats(&self) -> CacheStats {
+        CacheStats {
+            hot_size:    self.hot.read().size(),
+            warm_size:   self.warm.as_ref().map(|w| w.size()).unwrap_or(0),
+            hot_hits:    self.hot_hits.load(AtomicOrd::Relaxed),
+            warm_hits:   self.warm_hits.load(AtomicOrd::Relaxed),
+            cold_misses: self.cold_miss.load(AtomicOrd::Relaxed),
+        }
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// § 12  潮涌预热 TidePreloader — 优先级队列 + 令牌桶 + 生命周期控制
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct PreloadReq { pub id: String, pub priority: i32, pub ctx_score: f32 }
+
+impl PartialEq  for PreloadReq { fn eq(&self, o: &Self) -> bool { self.id == o.id } }
+impl Eq         for PreloadReq {}
+impl PartialOrd for PreloadReq { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
+impl Ord        for PreloadReq {
+    fn cmp(&self, o: &Self) -> Ordering {
+        let s = self.priority as f64 + self.ctx_score as f64;
+        let t = o.priority    as f64 + o.ctx_score    as f64;
+        s.partial_cmp(&t).unwrap_or(Ordering::Equal)
+    }
+}
+
+pub struct TidePreloader {
+    tx:      mpsc::Sender<PreloadReq>,
+    running: Arc<AtomicBool>,
+}
+
+impl TidePreloader {
+    pub fn new(cache: Arc<TieredCache>, rate_hz: u64, workers: usize) -> Self {
+        let (tx, mut rx) = mpsc::channel::<PreloadReq>(8192);
+        let running      = Arc::new(AtomicBool::new(true));
+        let tokens        = Arc::new(TokioRwLock::new(rate_hz));
+
+        // 令牌补充协程（每 1/rate_hz 秒补充一个令牌）
+        {
+            let t = tokens.clone(); let max = rate_hz; let r = running.clone();
+            tokio::spawn(async move {
+                let iv = Duration::from_millis(1000 / rate_hz.max(1));
+                while r.load(AtomicOrd::Relaxed) {
+                    tokio::time::sleep(iv).await;
+                    let mut v = t.write().await; *v = (*v + 1).min(max);
+                }
+            });
+        }
+        // 消费协程（优先级堆 + 令牌桶限速 + 并行worker）
+        {
+            let cc = cache.clone(); let tc = tokens.clone(); let r = running.clone();
+            let sem = Arc::new(Semaphore::new(workers.max(1)));
+            tokio::spawn(async move {
+                let mut heap: BinaryHeap<PreloadReq> = BinaryHeap::new();
+                while r.load(AtomicOrd::Relaxed) {
+                    match tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
+                        Ok(Some(req)) => { heap.push(req); }
+                        Ok(None)      => break,
+                        Err(_)        => {}
+                    }
+                    if let Ok(permit) = sem.clone().try_acquire_owned() {
+                        let mut tok = tc.write().await;
+                        if *tok > 0 {
+                            *tok -= 1; drop(tok);
+                            if let Some(req) = heap.pop() {
+                                let c = cc.clone();
+                                tokio::spawn(async move {
+                                    let _p = permit;
+                                    let _ = c.get(&req.id).await;
+                                    MET_PRELOADS.inc();
+                                    debug!("潮涌: preloaded {}", req.id);
+                                });
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        Self { tx, running }
+    }
+
+    pub async fn submit(&self, req: PreloadReq) -> ZResult<()> {
+        self.tx.send(req).await.map_err(|e| ZhiHunError::Other(format!("preloader: {}", e)))
+    }
+
+    pub fn stop(&self) { self.running.store(false, AtomicOrd::Relaxed); }
+
+    /// 按 access_count 降序预热热门记忆
+    pub async fn warmup_popular(&self, cache: &TieredCache, limit: usize) {
+        let mut beads = cache.hot_entries();
+        beads.sort_by(|a, b| b.bead_meta.access_count.cmp(&a.bead_meta.access_count));
+        for b in beads.iter().take(limit) {
+            let _ = self.submit(PreloadReq {
+                id:        b.id.clone(),
+                priority:  2,
+                ctx_score: b.bead_meta.confidence,
+            }).await;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// § 13  流学器 FluxLearner v2 — 动量在线学习
+//
+// 更新公式（带动量的随机梯度下降）：
+//   gradient = feedback - old_vec
+//   velocity = β * velocity_old + (1-β) * gradient
+//   new_vec  = normalize(old_vec + lr * velocity)
+//
+// β=0.9 时平滑了过去约 10/(1-β)=100 次梯度的指数移动平均，
+// 相比朴素梯度下降更稳定，避免单次强反馈导致记忆向量突变。
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct FluxLearner {
+    cache:    Arc<TieredCache>,
+    lr:       f32,
+    beta:     f32,
+    velocity: RwLock<HashMap<String, Vec<f32>>>,
+}
+
+impl FluxLearner {
+    pub fn new(cache: Arc<TieredCache>, lr: f32, beta: f32) -> Self {
+        Self {
+            cache,
+            lr:   lr.max(0.01).min(0.30),
+            beta: beta.max(0.0).min(0.99),
+            velocity: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub async fn apply_feedback(&self, id: &str, feedback: &[f32]) -> ZResult<()> {
+        let bead = self.cache.get(id).await?
+            .ok_or_else(|| ZhiHunError::NotFound(id.to_string()))?;
+
+        if feedback.len() != bead.vector.len() {
+            return Err(ZhiHunError::DimMismatch { expected: bead.vector.len(), actual: feedback.len() });
+        }
+
+        let dim = bead.vector.len();
+        // gradient = feedback - old_vec
+        let grad: Vec<f32> = feedback.iter().zip(&bead.vector).map(|(f, o)| f - o).collect();
+        // velocity = β * v_old + (1-β) * grad
+        let new_vel: Vec<f32> = {
+            let mut vmap = self.velocity.write();
+            let v_old = vmap.entry(id.to_string()).or_insert_with(|| vec![0.0; dim]);
+            let nv: Vec<f32> = v_old.iter().zip(&grad)
+                .map(|(vo, g)| self.beta * vo + (1.0 - self.beta) * g).collect();
+            *v_old = nv.clone(); nv
+        };
+        // new_vec = normalize(old + lr * velocity)
+        let new_raw: Vec<f32> = bead.vector.iter().zip(&new_vel)
+            .map(|(o, v)| o + self.lr * v).collect();
+        let new_vec = normalize_vec(new_raw);
+        let new_neg = negate_vec(&new_vec);
+        let updated = MemoryBead { vector: new_vec, neg_vector: new_neg, version: bead.version + 1, ..bead };
+        self.cache.insert(updated).await?;
+        debug!("流学: bead={} 向量已更新 (lr={:.3} β={:.2})", id, self.lr, self.beta);
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// § 14  虚境 VoidSandbox — wasmtime 受控执行（ResourceLimits 约束）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct VoidSandbox { engine: WasmEngine }
+
+impl VoidSandbox {
+    pub fn new() -> ZResult<Self> {
+        let mut cfg = WasmConfig::new();
+        cfg.cranelift_opt_level(OptLevel::Speed);
+        cfg.epoch_interruption(true);
+        let engine = WasmEngine::new(&cfg)
+            .map_err(|e| ZhiHunError::Wasm(format!("engine: {}", e)))?;
+        Ok(Self { engine })
+    }
+
+    /// 受控执行（ABI: `run_policy(input_ptr: i32, input_len: i32) -> i32`）
+    /// limits.max_cpu_time_ms → epoch deadline；limits.max_output_kb → 输出截断
+    pub fn execute(&self, wasm_bytes: &[u8], input_json: &str, limits: &ResourceLimits) -> ZResult<String> {
+        let module = WasmModule::new(&self.engine, wasm_bytes)
+            .map_err(|e| ZhiHunError::Wasm(format!("compile: {}", e)))?;
+        let mut store: WasmStore<()> = WasmStore::new(&self.engine, ());
+        let deadline = if limits.max_cpu_time_ms > 0 { (limits.max_cpu_time_ms / 10).max(1) } else { 100 };
+        store.set_epoch_deadline(deadline);
+        let linker: WasmLinker<()> = WasmLinker::new(&self.engine);
+        let inst = linker.instantiate(&mut store, &module)
+            .map_err(|e| ZhiHunError::Wasm(format!("inst: {}", e)))?;
+        let memory = inst.get_memory(&mut store, "memory")
+            .ok_or_else(|| ZhiHunError::Wasm("no memory export".into()))?;
+        let run = inst.get_typed_func::<(i32, i32), i32>(&mut store, "run_policy")
+            .map_err(|e| ZhiHunError::Wasm(format!("func: {}", e)))?;
+        let input = input_json.as_bytes();
+        memory.write(&mut store, 0, input)
+            .map_err(|e| ZhiHunError::Wasm(format!("write: {}", e)))?;
+        let out_len = run.call(&mut store, (0, input.len() as i32))
+            .map_err(|e| ZhiHunError::Wasm(format!("call: {}", e)))?;
+        let max_out = if limits.max_output_kb > 0 { (limits.max_output_kb * 1024) as usize } else { 1024 * 1024 };
+        let mut buf = vec![0u8; (out_len.max(0) as usize).min(max_out)];
+        memory.read(&mut store, 0, &mut buf)
+            .map_err(|e| ZhiHunError::Wasm(format!("read: {}", e)))?;
+        String::from_utf8(buf).map_err(|e| ZhiHunError::Wasm(format!("utf8: {}", e)))
+    }
+
+    pub fn validate(&self, wasm_bytes: &[u8]) -> ZResult<()> {
+        WasmModule::new(&self.engine, wasm_bytes)
+            .map_err(|e| ZhiHunError::Wasm(format!("validate: {}", e)))?;
+        Ok(())
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// § 15  技能层 — Skill Layer
+//
+// 四种感知运动原语：
+//   VisualLocate  — 物体位置检测（x/y/z + confidence）
+//   ArmControl    — 关节控制（目标位置 + 力）
+//   TactileRead   — 触觉压力读取
+//   ForceSense    — 六维力/力矩感知（闭合感知运动环路的关键）
+//
+// ForceSense 是 v2.0 相比 v1.0 最重要的感知扩展。
+// 力觉是触觉的深化：不仅知道"在接触"，还知道"用了多大力"
+// 以及力的方向。这对抓取和操作任务的精确性至关重要。
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[async_trait]
+pub trait SkillAtom: Send + Sync {
+    fn name(&self) -> &'static str;
+    async fn execute(&self, ctx: &ActionField, params: JsonValue) -> ZResult<JsonValue>;
+}
+
+pub struct VisualLocate;
+#[async_trait]
+impl SkillAtom for VisualLocate {
+    fn name(&self) -> &'static str { "visual_locate" }
+    async fn execute(&self, _ctx: &ActionField, params: JsonValue) -> ZResult<JsonValue> {
+        let obj = params.get("object").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let mut rng = rand::thread_rng();
+        Ok(json!({
+            "object": obj,
+            "x": rng.gen_range(-0.5f32..0.5),
+            "y": rng.gen_range(-0.5f32..0.5),
+            "z": rng.gen_range(0.0f32..1.2),
+            "confidence": rng.gen_range(0.7f32..1.0),
+        }))
+    }
+}
+
+pub struct ArmControl;
+#[async_trait]
+impl SkillAtom for ArmControl {
+    fn name(&self) -> &'static str { "arm_control" }
+    async fn execute(&self, ctx: &ActionField, params: JsonValue) -> ZResult<JsonValue> {
+        tokio::time::sleep(Duration::from_millis(30)).await; // 模拟执行延迟
+        ctx.incr("arm_control_executions");
+        Ok(json!({ "status": "reached", "params": params, "error_mm": rand::thread_rng().gen_range(0.0f32..2.0) }))
+    }
+}
+
+pub struct TactileRead;
+#[async_trait]
+impl SkillAtom for TactileRead {
+    fn name(&self) -> &'static str { "tactile_read" }
+    async fn execute(&self, _ctx: &ActionField, _params: JsonValue) -> ZResult<JsonValue> {
+        let mut rng = rand::thread_rng();
+        Ok(json!({
+            "pressure":    rng.gen_range(0.0f32..1.0),
+            "temperature": rng.gen_range(20.0f32..40.0),
+            "slip":        rng.gen_bool(0.05),
+        }))
+    }
+}
+
+/// 六维力觉感知（力/力矩/触觉阵列）
+pub struct ForceSense;
+#[async_trait]
+impl SkillAtom for ForceSense {
+    fn name(&self) -> &'static str { "force_sense" }
+    async fn execute(&self, ctx: &ActionField, _params: JsonValue) -> ZResult<JsonValue> {
+        let mut rng = rand::thread_rng();
+        let state = SensorState {
+            position: [rng.gen_range(-0.5..0.5), rng.gen_range(-0.5..0.5), rng.gen_range(0.0..1.5)],
+            force:    [rng.gen_range(-20.0f32..20.0), rng.gen_range(-20.0f32..20.0), rng.gen_range(-20.0f32..20.0)],
+            torque:   [rng.gen_range(-2.0f32..2.0),   rng.gen_range(-2.0f32..2.0),   rng.gen_range(-2.0f32..2.0)],
+            tactile:  (0..16).map(|_| rng.gen_range(0.0f32..1.0)).collect(),
+            visual:   None,
+            extra:    HashMap::new(),
+        };
+        ctx.incr("force_sense_reads");
+        Ok(serde_json::to_value(&state).unwrap_or(json!({})))
+    }
+}
+
+/// 技能原语枚举（可序列化，存储在 SkillWeave 中）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SkillPrimitive {
+    VisualLocate { params: JsonValue },
+    ArmControl   { params: JsonValue },
+    TactileRead  { params: JsonValue },
+    ForceSense   { params: JsonValue },
+    Custom       { name: String, params: JsonValue },
+}
+
+/// 技能织体（动态技能组合，可序列化存储为记忆珠）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillWeave {
+    pub id:          String,
+    pub name:        String,
+    pub skill_type:  SkillType,
+    pub primitives:  Vec<SkillPrimitive>,
+    pub tags:        Vec<String>,
+    pub created_at:  i64,
+    pub version:     u32,
+    pub success_rate:f32,
+    pub exec_count:  u64,
+    pub skill_meta:  SkillMetadata,
+}
+
+impl SkillWeave {
+    pub fn new(name: &str, primitives: Vec<SkillPrimitive>, tags: Vec<String>) -> Self {
+        Self {
+            id:          Uuid::new_v4().to_string(),
+            name:        name.to_string(),
+            skill_type:  SkillType::Composite,
+            primitives,
+            tags,
+            created_at:  Utc::now().timestamp(),
+            version:     1,
+            success_rate:1.0,
+            exec_count:  0,
+            skill_meta:  SkillMetadata::default(),
+        }
+    }
+
+    pub fn with_timeout(mut self, ms: u64) -> Self { self.skill_meta.timeout_ms = ms; self }
+    pub fn with_author(mut self, a: impl Into<String>) -> Self { self.skill_meta.author = a.into(); self }
+    pub fn with_description(mut self, d: impl Into<String>) -> Self { self.skill_meta.description = d.into(); self }
+}
+
+/// 技能库（O(1) 名称索引）
+pub struct SkillVault { by_name: HashMap<String, Arc<dyn SkillAtom>> }
+
+impl Default for SkillVault { fn default() -> Self { Self::new() } }
+
+impl SkillVault {
+    pub fn new() -> Self {
+        let mut m: HashMap<String, Arc<dyn SkillAtom>> = HashMap::new();
+        m.insert("visual_locate".into(), Arc::new(VisualLocate));
+        m.insert("arm_control".into(),   Arc::new(ArmControl));
+        m.insert("tactile_read".into(),  Arc::new(TactileRead));
+        m.insert("force_sense".into(),   Arc::new(ForceSense));
+        Self { by_name: m }
+    }
+
+    pub fn register(&mut self, skill: Arc<dyn SkillAtom>) { self.by_name.insert(skill.name().to_string(), skill); }
+    pub fn get(&self, name: &str) -> Option<Arc<dyn SkillAtom>> { self.by_name.get(name).cloned() }
+    pub fn count(&self) -> usize { self.by_name.len() }
+    pub fn list(&self) -> Vec<(&str, SkillType)> {
+        self.by_name.keys().map(|n| (n.as_str(), SkillType::Atomic)).collect()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// § 16  行动场 ActionField + 行动机 ActionEngine（含超时保护）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct ActionField { metrics: RwLock<HashMap<String, u64>> }
+
+impl ActionField {
+    pub fn new() -> Self { Self { metrics: RwLock::new(HashMap::new()) } }
+    pub fn incr(&self, k: &str) { *self.metrics.write().entry(k.to_string()).or_insert(0) += 1; }
+    pub fn snapshot(&self) -> HashMap<String, u64> { self.metrics.read().clone() }
+}
+
+pub struct ActionEngine {
+    vault:  Arc<RwLock<SkillVault>>,
+    field:  Arc<ActionField>,
+    zhihun: Arc<ZhiHun>,
+}
+
+impl ActionEngine {
+    pub fn new(vault: Arc<RwLock<SkillVault>>, field: Arc<ActionField>, zh: Arc<ZhiHun>) -> Self {
+        Self { vault, field, zhihun: zh }
+    }
+
+    /// 通过记忆珠 ID 执行技能（自动预热 + 闭环学习）
+    pub async fn execute_by_id(&self, skill_id: &str) -> ZResult<JsonValue> {
+        let bead = self.zhihun.cache.get(skill_id).await?
+            .ok_or_else(|| ZhiHunError::NotFound(skill_id.to_string()))?;
+        // 触发关联记忆预热（不阻塞执行路径）
+        {
+            let zh = self.zhihun.clone();
+            let id = skill_id.to_string();
+            tokio::spawn(async move {
+                let _ = zh.preload_related(&id, 8, PreloadStrategy::TopNeighbors).await;
+            });
+        }
+        match serde_json::from_value::<SkillWeave>(bead.payload.clone()) {
+            Ok(weave) => self.execute_weave(&weave).await,
+            Err(_)    => {
+                let vault = self.vault.read();
+                vault.get(skill_id)
+                    .ok_or_else(|| ZhiHunError::Skill(format!("skill not found: {}", skill_id)))?
+                    .execute(&self.field, json!({})).await
+            }
+        }
+    }
+
+    /// 执行技能织体（含超时保护）
+    pub async fn execute_weave(&self, weave: &SkillWeave) -> ZResult<JsonValue> {
+        let timeout_ms = weave.skill_meta.timeout_ms;
+        let fut = self.run_primitives(weave);
+
+        let result = if timeout_ms > 0 {
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut).await
+                .map_err(|_| ZhiHunError::Timeout(format!("skill '{}' exceeded {}ms", weave.name, timeout_ms)))?
+        } else {
+            fut.await
+        }?;
+
+        self.field.incr("weave_executions");
+        MET_SKILLS.inc();
+
+        // 执行结果反馈到记忆层（闭环学习：每次成功执行都轻微强化记忆）
+        if let Ok(rs) = serde_json::to_string(&result) {
+            if let Ok(fv) = self.zhihun.echo.embed(&rs).await {
+                let _ = self.zhihun.learner.apply_feedback(&weave.id, &fv).await;
+            }
+        }
+
+        info!("行动机: {} 完成 ({} 原语)", weave.name, weave.primitives.len());
+        Ok(result)
+    }
+
+    async fn run_primitives(&self, weave: &SkillWeave) -> ZResult<JsonValue> {
+        let mut last = json!({});
+        for prim in &weave.primitives {
+            let v = self.vault.read();
+            last = match prim {
+                SkillPrimitive::VisualLocate { params } =>
+                    v.get("visual_locate").ok_or_else(|| ZhiHunError::Skill("visual_locate not found".into()))?
+                        .execute(&self.field, params.clone()).await?,
+                SkillPrimitive::ArmControl { params } =>
+                    v.get("arm_control").ok_or_else(|| ZhiHunError::Skill("arm_control not found".into()))?
+                        .execute(&self.field, params.clone()).await?,
+                SkillPrimitive::TactileRead { params } =>
+                    v.get("tactile_read").ok_or_else(|| ZhiHunError::Skill("tactile_read not found".into()))?
+                        .execute(&self.field, params.clone()).await?,
+                SkillPrimitive::ForceSense { params } =>
+                    v.get("force_sense").ok_or_else(|| ZhiHunError::Skill("force_sense not found".into()))?
+                        .execute(&self.field, params.clone()).await?,
+                SkillPrimitive::Custom { name, params } =>
+                    v.get(name).ok_or_else(|| ZhiHunError::Skill(format!("custom '{}' not found", name)))?
+                        .execute(&self.field, params.clone()).await?,
+            };
+        }
+        Ok(last)
+    }
+}
+
+/// 将 SkillWeave 序列化为记忆珠并写入织魂记忆层
+pub async fn store_skill_weave(zh: &ZhiHun, weave: &SkillWeave) -> ZResult<MemoryBead> {
+    let vec     = zh.echo.embed(&weave.name).await?;
+    let payload = serde_json::to_value(weave).unwrap_or(json!({}));
+    let bead    = MemoryBead::new(weave.tags.clone(), vec, payload)
+        .with_id(weave.id.clone())
+        .with_confidence(weave.success_rate)
+        .with_source("skill_vault");
+    zh.insert(bead.clone()).await?;
+    // 同步写入技能名称索引（O(1) 按名称查找支持）
+    let skill_bin = bincode::serialize(weave)?;
+    zh.storage.insert_skill_payload(&weave.id, &weave.name, &skill_bin).await?;
+    Ok(bead)
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// § 17  织魂 ZhiHun v2.0 — 主编排器
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Clone, Copy)]
+pub enum PreloadStrategy { TopNeighbors, KHop(usize), PageRank }
+
+pub struct ZhiHun {
+    pub cache:     Arc<TieredCache>,
+    pub hnsw:      Arc<StarSailManager>,
+    pub graph:     Arc<ResonanceGraph>,
+    pub echo:      Arc<dyn EchoProvider>,
+    pub preloader: Arc<TidePreloader>,
+    pub learner:   Arc<FluxLearner>,
+    pub resonance: Arc<PolarResonance>,
+    pub storage:   Arc<dyn AbyssStore>,
+    label_to_id:   RwLock<HashMap<usize, String>>,
+    id_to_label:   RwLock<HashMap<String, usize>>,
+    next_label:    AtomicUsize,
+    pub config:    ZhiHunConfig,
+    start_time:    Instant,
+}
+
+impl ZhiHun {
+    pub async fn new(
+        config:  ZhiHunConfig,
+        storage: Arc<dyn AbyssStore>,
+        echo:    Arc<dyn EchoProvider>,
+    ) -> ZResult<Arc<Self>> {
+        let warm = if !config.warm_db_path.is_empty() {
+            WarmLayer::open(&config.warm_db_path).ok().map(Arc::new)
+        } else { None };
+
+        let cache = Arc::new(TieredCache::new(storage.clone(), warm, config.hot_capacity));
+        let hnsw  = Arc::new(StarSailManager::new(
+            PathBuf::from(&config.hnsw_index_path)
+                .parent().unwrap_or(Path::new(".")).to_path_buf(),
+            config.vector_dim, config.hnsw_m, config.hnsw_ef_construction,
+        )?);
+        let graph = Arc::new(ResonanceGraph::new(config.decay_half_life_secs));
+
+        // 从持久化共现表恢复图
+        let cooc = storage.load_cooc().await?;
+        graph.load_from_map(cooc.into_iter().map(|(a, nbrs)|
+            (a, nbrs.into_iter().map(|(b, (cnt, et))| (b, (cnt, et))).collect())
+        ).collect());
+
+        let preloader = Arc::new(TidePreloader::new(cache.clone(), config.preload_rate_hz, config.preload_workers));
+        let learner   = Arc::new(FluxLearner::new(cache.clone(), config.online_learn_lr, config.momentum));
+        let resonance = Arc::new(PolarResonance::new(graph.clone(), config.alpha, config.xi, config.gamma));
+
+        let zh = Arc::new(Self {
+            cache, hnsw, graph, echo, preloader, learner, resonance, storage,
+            label_to_id: RwLock::new(HashMap::new()),
+            id_to_label:  RwLock::new(HashMap::new()),
+            next_label:   AtomicUsize::new(0),
+            config: config.clone(),
+            start_time:   Instant::now(),
+        });
+
+        zh.warmup_from_cold().await?;
+
+        // TTL 过期清理协程
+        {
+            let zh_c = zh.clone();
+            let secs = config.ttl_check_interval_secs;
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(secs)).await;
+                    zh_c.evict_expired().await;
+                }
+            });
+        }
+        // 定期持久化 HNSW 索引
+        {
+            let zh_c = zh.clone();
+            let secs = config.index_save_interval_secs;
+            if secs > 0 {
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(secs)).await;
+                        if let Err(e) = zh_c.hnsw.persist() { warn!("索引保存失败: {:?}", e); }
+                    }
+                });
+            }
+        }
+
+        Ok(zh)
+    }
+
+    async fn warmup_from_cold(&self) -> ZResult<()> {
+        let beads = self.storage.all_beads().await?;
+        let n = beads.len();
+        let items: Vec<(usize, Vec<f32>)> = beads.iter().enumerate()
+            .map(|(i, b)| (i, b.vector.clone())).collect();
+        for (i, bead) in beads.into_iter().enumerate() {
+            self.label_to_id.write().insert(i, bead.id.clone());
+            self.id_to_label.write().insert(bead.id.clone(), i);
+            self.cache.hot.write().insert(bead);
+        }
+        if !items.is_empty() { self.hnsw.active.read().batch_insert(items)?; }
+        self.next_label.store(n, AtomicOrd::SeqCst);
+        info!("织魂: 从冷层预热 {} 条记忆珠", n);
+        Ok(())
+    }
+
+    // ── 写入 ─────────────────────────────────────────────────────────────────
+
+    pub async fn insert(&self, bead: MemoryBead) -> ZResult<String> {
+        let id    = bead.id.clone();
+        let vec   = bead.vector.clone();
+        let label = self.next_label.fetch_add(1, AtomicOrd::SeqCst);
+        self.label_to_id.write().insert(label, id.clone());
+        self.id_to_label.write().insert(id.clone(), label);
+        self.cache.insert(bead).await?;
+        self.hnsw.insert(label, vec)?;
+        MET_INSERTS.inc();
+        MET_HOT_SZ.set(self.cache.hot_size() as i64);
+        Ok(id)
+    }
+
+    pub async fn insert_text(
+        &self,
+        tags:       Vec<String>,
+        text:       &str,
+        payload:    JsonValue,
+        ttl:        Option<u64>,
+        confidence: Option<f32>,
+    ) -> ZResult<String> {
+        let vec  = self.echo.embed(text).await?;
+        let mut b = MemoryBead::new(tags, vec, payload);
+        if let Some(t) = ttl { b = b.with_ttl(t); }
+        if let Some(c) = confidence { b = b.with_confidence(c); }
+        self.insert(b).await
+    }
+
+    // ── 共振检索（核心方法）─────────────────────────────────────────────────
+    //
+    // 策略：先用 HNSW 取 candidate_mult 倍的候选，
+    // 再用精确的共振公式（α/ξ/γ）重排序。
+    // 这样在 O(log n) 的代价下获得精确的极性互补评分结果。
+
+    pub async fn query_resonant(
+        &self,
+        query:   &[f32],
+        top_k:   usize,
+        ctx_ids: &[String],
+    ) -> ZResult<Vec<(MemoryBead, f32)>> {
+        MET_QUERIES.inc();
+        let candidates = self.hnsw.search(query, top_k * self.config.candidate_mult, self.config.hnsw_ef_search);
+        let mut scored: Vec<(MemoryBead, f32)> = Vec::with_capacity(candidates.len());
+        for (label, _) in candidates {
+            let id = { self.label_to_id.read().get(&label).cloned() };
+            if let Some(id) = id {
+                if let Some(bead) = self.cache.get(&id).await? {
+                    let score = self.resonance.score_ctx(query, &bead, ctx_ids);
+                    scored.push((bead, score));
+                }
+            }
+        }
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        scored.truncate(top_k);
+        Ok(scored)
+    }
+
+    pub async fn query_text(&self, text: &str, top_k: usize) -> ZResult<Vec<(MemoryBead, f32)>> {
+        let vec = self.echo.embed(text).await?;
+        self.query_resonant(&vec, top_k, &[]).await
+    }
+
+    // ── 其他操作 ─────────────────────────────────────────────────────────────
+
+    pub async fn get(&self, id: &str) -> ZResult<Option<MemoryBead>> { self.cache.get(id).await }
+
+    pub async fn delete(&self, id: &str) -> ZResult<bool> {
+        let existed = self.storage.delete_bead(id).await?;
+        self.cache.hot.write().remove(id);
+        self.id_to_label.write().remove(id);
+        Ok(existed)
+    }
+
+    pub async fn apply_feedback(&self, id: &str, fb: &[f32]) -> ZResult<()> {
+        self.learner.apply_feedback(id, fb).await
+    }
+
+    pub async fn record_cooccurrence(&self, a: &str, b: &str) -> ZResult<()> {
+        self.record_cooccurrence_typed(a, b, EdgeType::Semantic).await
+    }
+
+    pub async fn record_cooccurrence_typed(&self, a: &str, b: &str, et: EdgeType) -> ZResult<()> {
+        self.graph.upsert(a, b, 1, et.clone());
+        let store = self.storage.clone();
+        let (a, b, et) = (a.to_string(), b.to_string(), et);
+        tokio::spawn(async move { let _ = store.upsert_cooc(&a, &b, 1, &et).await; });
+        Ok(())
+    }
+
+    pub async fn preload_related(&self, id: &str, k: usize, strategy: PreloadStrategy) -> ZResult<()> {
+        let neighbors: Vec<(String, f32)> = match strategy {
+            PreloadStrategy::TopNeighbors => self.graph.top_neighbors(id, k).into_iter().map(|(i, w)| (i, w as f32)).collect(),
+            PreloadStrategy::KHop(hops)   => self.graph.k_hop(id, hops).into_iter().map(|i| (i, 1.0)).collect(),
+            PreloadStrategy::PageRank     => self.graph.pagerank(id, k).into_iter().map(|(i, w)| (i, w as f32)).collect(),
+        };
+        for (nid, cs) in neighbors {
+            self.preloader.submit(PreloadReq { id: nid, priority: 1, ctx_score: cs }).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn rebuild_index(self: Arc<Self>) -> ZResult<String> {
+        let ver = Utc::now().format("%Y%m%d_%H%M%S").to_string();
+        let mgr = self.hnsw.clone(); let store = self.storage.clone(); let v = ver.clone();
+        tokio::spawn(async move {
+            match mgr.rebuild_background(store, v).await {
+                Ok(p)  => info!("索引重建完成: {}", p),
+                Err(e) => error!("索引重建失败: {:?}", e),
+            }
+        });
+        Ok(ver)
+    }
+
+    /// 全量导出为 JSONL 文件
+    pub async fn export_jsonl(&self, path: &Path) -> ZResult<usize> {
+        let beads = self.storage.all_beads().await?;
+        let n     = beads.len();
+        let mut w = BufWriter::new(fs::File::create(path)?);
+        for b in &beads {
+            let line = serde_json::to_string(b)?;
+            w.write_all(line.as_bytes())?;
+            w.write_all(b"\n")?;
+        }
+        w.flush()?;
+        info!("导出: {} 条记忆珠 → {:?}", n, path);
+        Ok(n)
+    }
+
+    /// 系统状态聚合（单次 HTTP 健康检查完整响应）
+    pub fn status(&self, skill_count: usize) -> SystemStatus {
+        SystemStatus {
+            version:        "2.0.0",
+            uptime_seconds: self.start_time.elapsed().as_secs(),
+            bead_count:     self.cache.hot_size(),
+            graph:          self.graph.stats(),
+            cache:          self.cache.stats(),
+            skill_count,
+            alpha:          self.config.alpha,
+            xi:             self.config.xi,
+            gamma:          self.config.gamma,
+            hot_capacity:   self.config.hot_capacity,
+            vector_dim:     self.config.vector_dim,
+        }
+    }
+
+    async fn evict_expired(&self) {
+        let expired: Vec<String> = self.cache.hot_entries().iter()
+            .filter(|b| b.is_expired()).map(|b| b.id.clone()).collect();
+        for id in expired { let _ = self.cache.delete(&id).await; }
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// § 18  HTTP API — axum 完整路由
+// ═══════════════════════════════════════════════════════════════════════════════
+
+struct AppState {
+    zh:      Arc<ZhiHun>,
+    engine:  Arc<ActionEngine>,
+    vault:   Arc<RwLock<SkillVault>>,
+    storage: Arc<dyn AbyssStore>,
+    field:   Arc<ActionField>,
+}
+
+// ── 请求 / 响应结构 ───────────────────────────────────────────────────────────
+
+#[derive(Deserialize)] struct InsertReq   { text: Option<String>, tags: Option<Vec<String>>, payload: Option<JsonValue>, ttl_secs: Option<u64> }
+#[derive(Deserialize)] struct QueryReq    { q: String, top_k: Option<usize>, context_ids: Option<Vec<String>> }
+#[derive(Deserialize)] struct CoocReq     { a: String, b: String, edge_type: Option<String> }
+#[derive(Deserialize)] struct FeedbackReq { id: String, vector: Vec<f32> }
+#[derive(Deserialize)] struct StoreSkillReq { name: String, tags: Option<Vec<String>>, primitives: Vec<SkillPrimitive>, timeout_ms: Option<u64> }
+#[derive(Deserialize)] struct ExecSkillReq  { skill_id: String }
+#[derive(Deserialize)] struct NeighborsQuery { k: Option<usize>, edge_type: Option<String> }
+
+// ── 处理器 ────────────────────────────────────────────────────────────────────
+
+async fn h_insert(State(s): State<Arc<AppState>>, Json(req): Json<InsertReq>) -> impl IntoResponse {
+    let tags    = req.tags.unwrap_or_default();
+    let payload = req.payload.unwrap_or(json!({}));
+    let Some(text) = req.text else { return (StatusCode::BAD_REQUEST, "text required").into_response(); };
+    match s.zh.insert_text(tags, &text, payload, req.ttl_secs, None).await {
+        Ok(id) => (StatusCode::CREATED, Json(json!({"id": id}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{:?}", e)).into_response(),
+    }
+}
+
+async fn h_get_bead(State(s): State<Arc<AppState>>, AxumPath(id): AxumPath<String>) -> impl IntoResponse {
+    match s.zh.get(&id).await {
+        Ok(Some(b)) => (StatusCode::OK, Json(json!({"bead": b}))).into_response(),
+        Ok(None)    => (StatusCode::NOT_FOUND, "not found").into_response(),
+        Err(e)      => (StatusCode::INTERNAL_SERVER_ERROR, format!("{:?}", e)).into_response(),
+    }
+}
+
+async fn h_delete_bead(State(s): State<Arc<AppState>>, AxumPath(id): AxumPath<String>) -> impl IntoResponse {
+    match s.zh.delete(&id).await {
+        Ok(true)  => (StatusCode::OK, "deleted").into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "not found").into_response(),
+        Err(e)    => (StatusCode::INTERNAL_SERVER_ERROR, format!("{:?}", e)).into_response(),
+    }
+}
+
+async fn h_query(State(s): State<Arc<AppState>>, Query(p): Query<QueryReq>) -> impl IntoResponse {
+    let top_k = p.top_k.unwrap_or(8);
+    let ctx   = p.context_ids.unwrap_or_default();
+    match s.zh.query_text(&p.q, top_k).await {
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{:?}", e)).into_response(),
+        Ok(results) => {
+            let hits: Vec<JsonValue> = results.into_iter().map(|(b, sc)| json!({
+                "id": b.id, "tags": b.tags, "score": sc, "payload": b.payload,
+                "access_count": b.bead_meta.access_count, "confidence": b.bead_meta.confidence,
+            })).collect();
+            (StatusCode::OK, Json(json!({"hits": hits, "alpha": s.zh.config.alpha, "xi": s.zh.config.xi, "gamma": s.zh.config.gamma}))).into_response()
+        }
+    }
+}
+
+async fn h_cooccurrence(State(s): State<Arc<AppState>>, Json(req): Json<CoocReq>) -> impl IntoResponse {
+    let et = match req.edge_type.as_deref().unwrap_or("semantic") {
+        "sequential" => EdgeType::Sequential,
+        "causal"     => EdgeType::Causal,
+        x if x.starts_with("custom:") => EdgeType::Custom(x[7..].to_string()),
+        _            => EdgeType::Semantic,
+    };
+    match s.zh.record_cooccurrence_typed(&req.a, &req.b, et).await {
+        Ok(_)  => (StatusCode::OK, "recorded").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{:?}", e)).into_response(),
+    }
+}
+
+async fn h_feedback(State(s): State<Arc<AppState>>, Json(req): Json<FeedbackReq>) -> impl IntoResponse {
+    match s.zh.apply_feedback(&req.id, &req.vector).await {
+        Ok(_)  => (StatusCode::OK, "applied").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{:?}", e)).into_response(),
+    }
+}
+
+async fn h_graph_neighbors(
+    State(s): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Query(q): Query<NeighborsQuery>,
+) -> impl IntoResponse {
+    let k  = q.k.unwrap_or(10);
+    let ns = match q.edge_type.as_deref() {
+        Some("sequential") => s.zh.graph.neighbors_by_type(&id, k, &EdgeType::Sequential),
+        Some("causal")     => s.zh.graph.neighbors_by_type(&id, k, &EdgeType::Causal),
+        _                  => s.zh.graph.top_neighbors(&id, k),
+    };
+    let out: Vec<JsonValue> = ns.iter().map(|(nid, w)| json!({"id": nid, "weight": w})).collect();
+    (StatusCode::OK, Json(json!({"node": id, "neighbors": out}))).into_response()
+}
+
+async fn h_store_skill(State(s): State<Arc<AppState>>, Json(req): Json<StoreSkillReq>) -> impl IntoResponse {
+    let mut weave = SkillWeave::new(&req.name, req.primitives, req.tags.unwrap_or_default());
+    if let Some(ms) = req.timeout_ms { weave = weave.with_timeout(ms); }
+    match store_skill_weave(&s.zh, &weave).await {
+        Ok(bead) => (StatusCode::CREATED, Json(json!({"id": bead.id, "skill_id": weave.id}))).into_response(),
+        Err(e)   => (StatusCode::INTERNAL_SERVER_ERROR, format!("{:?}", e)).into_response(),
+    }
+}
+
+async fn h_list_skills(State(s): State<Arc<AppState>>) -> impl IntoResponse {
+    let list: Vec<JsonValue> = s.vault.read().list().iter()
+        .map(|(n, t)| json!({"name": n, "type": format!("{:?}", t)})).collect();
+    (StatusCode::OK, Json(json!({"skills": list, "count": list.len()}))).into_response()
+}
+
+async fn h_exec_skill(State(s): State<Arc<AppState>>, Json(req): Json<ExecSkillReq>) -> impl IntoResponse {
+    match s.engine.execute_by_id(&req.skill_id).await {
+        Ok(r)  => (StatusCode::OK, Json(json!({"result": r, "metrics": s.field.snapshot()}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{:?}", e)).into_response(),
+    }
+}
+
+async fn h_rebuild(State(s): State<Arc<AppState>>, _: Json<JsonValue>) -> impl IntoResponse {
+    match s.zh.clone().rebuild_index().await {
+        Ok(v)  => (StatusCode::ACCEPTED, Json(json!({"version": v}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{:?}", e)).into_response(),
+    }
+}
+
+async fn h_system_status(State(s): State<Arc<AppState>>) -> impl IntoResponse {
+    let status = s.zh.status(s.vault.read().count());
+    (StatusCode::OK, Json(status)).into_response()
+}
+
+async fn h_cache_stats(State(s): State<Arc<AppState>>) -> impl IntoResponse {
+    let cs = s.zh.cache.stats();
+    (StatusCode::OK, Json(json!({
+        "hot_size": cs.hot_size, "warm_size": cs.warm_size,
+        "hot_hits": cs.hot_hits, "warm_hits": cs.warm_hits,
+        "cold_misses": cs.cold_misses, "hit_rate": cs.hit_rate(),
+    }))).into_response()
+}
+
+async fn h_graph_stats(State(s): State<Arc<AppState>>) -> impl IntoResponse {
+    let gs = s.zh.graph.stats();
+    (StatusCode::OK, Json(json!({
+        "node_count": gs.node_count, "edge_count": gs.edge_count,
+        "avg_degree": gs.avg_degree, "max_degree": gs.max_degree,
+    }))).into_response()
+}
+
+async fn h_metrics() -> impl IntoResponse {
+    let mut buf = Vec::new();
+    let enc = TextEncoder::new();
+    enc.encode(&REGISTRY.gather(), &mut buf).unwrap();
+    (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, enc.format_type().to_string())], buf).into_response()
+}
+
+async fn h_health() -> impl IntoResponse { (StatusCode::OK, "织魂 ZhiHun v2.0 — alive") }
+
+pub fn build_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        // 记忆层
+        .route("/memory",                      post(h_insert))
+        .route("/memory/:id",                  get(h_get_bead))
+        .route("/memory/:id",                  delete(h_delete_bead))
+        .route("/memory/query",                get(h_query))
+        .route("/memory/cooccurrence",         post(h_cooccurrence))
+        .route("/memory/:id/feedback",         post(h_feedback))
+        .route("/memory/:id/neighbors",        get(h_graph_neighbors))
+        // 技能层
+        .route("/skills",                      post(h_store_skill))
+        .route("/skills",                      get(h_list_skills))
+        .route("/skills/:id/execute",          post(h_exec_skill))
+        // 管理层
+        .route("/admin/rebuild",               post(h_rebuild))
+        .route("/system/status",               get(h_system_status))
+        .route("/system/cache",                get(h_cache_stats))
+        .route("/system/graph",                get(h_graph_stats))
+        .route("/metrics",                     get(h_metrics))
+        .route("/health",                      get(h_health))
+        .with_state(state)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// § 19  CLI — clap（serve / demo / export / config 四模式）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Parser, Debug)]
+#[command(name = "zhihun", version = "2.0.0", about = "织魂 ZhiHun v2.0 — 生命记忆与技能执行引擎")]
+struct Cli {
+    #[command(subcommand)]
+    command: CliCmd,
+}
+
+#[derive(Subcommand, Debug)]
+enum CliCmd {
+    /// 启动 HTTP 服务
+    Serve {
+        #[arg(short, long, help = "JSON 配置文件路径")] config: Option<PathBuf>,
+        #[arg(short, long, help = "覆盖监听地址")]      bind:   Option<String>,
+    },
+    /// 演示模式（存储示例技能 + 查询 + 可选执行）
+    Demo {
+        #[arg(short, long)] config:  Option<PathBuf>,
+        #[arg(long, default_value_t = false, help = "执行技能")] execute: bool,
+    },
+    /// 导出全量记忆珠为 JSONL 文件
+    Export {
+        #[arg(short, long, help = "输出文件路径")] output: PathBuf,
+        #[arg(short, long)] config: Option<PathBuf>,
+    },
+    /// 打印当前有效配置（JSON 格式）
+    Config {
+        #[arg(short, long)] config: Option<PathBuf>,
+    },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// § 20  main — 程序入口
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env()
+            .add_directive("zhihun=info".parse().unwrap()))
+        .init();
+    init_metrics();
+
+    let cli = Cli::parse();
+    match cli.command {
+        CliCmd::Serve  { config, bind }       => cmd_serve(config, bind).await,
+        CliCmd::Demo   { config, execute }    => cmd_demo(config, execute).await,
+        CliCmd::Export { output, config }     => cmd_export(output, config).await,
+        CliCmd::Config { config }             => cmd_print_config(config).await,
+    }
+}
+
+async fn load_config(path: Option<PathBuf>) -> anyhow::Result<ZhiHunConfig> {
+    let mut cfg = ZhiHunConfig::default();
+    if let Some(p) = path {
+        cfg = ZhiHunConfig::from_file(&p).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        info!("配置: 从 {:?} 加载", p);
+    }
+    cfg.validate().map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Ok(cfg)
+}
+
+async fn make_storage(cfg: &ZhiHunConfig) -> anyhow::Result<Arc<dyn AbyssStore>> {
+    if cfg.database_url.is_empty() {
+        info!("存储: Sled ({})", cfg.db_path);
+        Ok(Arc::new(SledAbyss::open(&cfg.db_path).map_err(|e| anyhow::anyhow!("{:?}", e))?))
+    } else {
+        info!("存储: Postgres");
+        let pg = PostgresAbyss::new(&cfg.database_url).await.map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        pg.init_schema().await.map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Ok(Arc::new(pg))
+    }
+}
+
+fn make_echo(cfg: &ZhiHunConfig) -> Arc<dyn EchoProvider> {
+    if !cfg.onnx_model_path.is_empty() && !cfg.tokenizer_path.is_empty() {
+        match OnnxEcho::new(&cfg.onnx_model_path, &cfg.tokenizer_path, cfg.vector_dim,
+                            cfg.onnx_provider.to_uppercase() == "CUDA") {
+            Ok(e)  => { info!("Embedding: ONNX (dim={})", cfg.vector_dim); return Arc::new(e); }
+            Err(e) => warn!("ONNX init 失败 ({:?})，回退确定性模式", e),
+        }
+    }
+    info!("Embedding: 确定性FNV (dim={})", cfg.vector_dim);
+    Arc::new(DeterministicEcho::new(cfg.vector_dim))
+}
+
+async fn cmd_serve(config_path: Option<PathBuf>, bind_override: Option<String>) -> anyhow::Result<()> {
+    let mut cfg = load_config(config_path).await?;
+    if let Some(b) = bind_override { cfg.http_bind = b; }
+    let storage = make_storage(&cfg).await?;
+    let echo    = make_echo(&cfg);
+    let zh      = ZhiHun::new(cfg.clone(), storage.clone(), echo).await.map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let vault   = Arc::new(RwLock::new(SkillVault::new()));
+    let field   = Arc::new(ActionField::new());
+    let engine  = Arc::new(ActionEngine::new(vault.clone(), field.clone(), zh.clone()));
+    info!("织魂 v2.0 上线 | α={} ξ={} γ={} dim={} hot={}", cfg.alpha, cfg.xi, cfg.gamma, cfg.vector_dim, cfg.hot_capacity);
+    let state = Arc::new(AppState { zh, engine, vault, storage, field });
+    let app   = build_router(state);
+    let bind: std::net::SocketAddr = cfg.http_bind.parse()?;
+    info!("HTTP 服务启动于 {}", bind);
+    
+    // 修复: axum 0.7 使用 TcpListener + axum::serve
+    let listener = TcpListener::bind(bind).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn cmd_demo(config_path: Option<PathBuf>, do_exec: bool) -> anyhow::Result<()> {
+    let cfg     = load_config(config_path).await?;
+    let storage = make_storage(&cfg).await?;
+    let echo    = make_echo(&cfg);
+    let zh      = ZhiHun::new(cfg.clone(), storage.clone(), echo).await.map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let vault   = Arc::new(RwLock::new(SkillVault::new()));
+    let field   = Arc::new(ActionField::new());
+    let engine  = Arc::new(ActionEngine::new(vault.clone(), field.clone(), zh.clone()));
+
+    // 存储互为侧别的双手技能（展示 ξ 极性互补效果）
+    let wr = SkillWeave::new("grasp_cup_right",
+        vec![
+            SkillPrimitive::VisualLocate { params: json!({"object": "cup"}) },
+            SkillPrimitive::ForceSense   { params: json!({}) },
+            SkillPrimitive::ArmControl   { params: json!({"target": {"x": 0.2, "y": 0.0, "z": 0.15}, "force": 0.6}) },
+            SkillPrimitive::TactileRead  { params: json!({}) },
+        ],
+        vec!["manipulation".into(), "grasp".into(), "right_hand".into()])
+        .with_timeout(2000)
+        .with_author("system")
+        .with_description("右手抓杯：视觉定位→力觉检测→臂控制→触觉确认");
+
+    let wl = SkillWeave::new("grasp_cup_left",
+        vec![
+            SkillPrimitive::VisualLocate { params: json!({"object": "cup"}) },
+            SkillPrimitive::ForceSense   { params: json!({}) },
+            SkillPrimitive::ArmControl   { params: json!({"target": {"x": -0.2, "y": 0.0, "z": 0.15}, "force": 0.6}) },
+            SkillPrimitive::TactileRead  { params: json!({}) },
+        ],
+        vec!["manipulation".into(), "grasp".into(), "left_hand".into()])
+        .with_timeout(2000)
+        .with_author("system")
+        .with_description("左手抓杯：与右手对称，通过ξ极性互补彼此泛化");
+
+    let br = store_skill_weave(&zh, &wr).await.map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let bl = store_skill_weave(&zh, &wl).await.map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    // 记录语义共现（右手↔左手经常一起被召回）
+    zh.record_cooccurrence_typed(&br.id, &bl.id, EdgeType::Semantic).await
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    info!("技能已存储: right={:.8} left={:.8}", br.id, bl.id);
+
+    // 共振检索演示（预期同时检索到右手和左手技能）
+    let results = zh.query_text("grasp cup right hand", 5).await
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    info!("共振检索结果 (α={} ξ={} γ={}):", cfg.alpha, cfg.xi, cfg.gamma);
+    for (i, (b, sc)) in results.iter().enumerate() {
+        info!("  {}. {:8.8}  {:?}  score={:.4}", i + 1, b.id, b.tags, sc);
+    }
+
+    if do_exec {
+        let result = engine.execute_by_id(&br.id).await
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        info!("技能执行结果: {}", serde_json::to_string_pretty(&result)?);
+        info!("行动场指标: {:?}", field.snapshot());
+    }
+
+    let status = zh.status(vault.read().count());
+    info!(
+        "系统状态: beads={} graph_nodes={} graph_edges={} cache_hit={:.1}%",
+        status.bead_count, status.graph.node_count, status.graph.edge_count,
+        status.cache.hit_rate() * 100.0
+    );
+    Ok(())
+}
+
+async fn cmd_export(output: PathBuf, config_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let cfg     = load_config(config_path).await?;
+    let storage = make_storage(&cfg).await?;
+    let echo    = make_echo(&cfg);
+    let zh      = ZhiHun::new(cfg, storage, echo).await.map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let n = zh.export_jsonl(&output).await.map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    println!("导出完成: {} 条记忆珠 → {:?}", n, output);
+    Ok(())
+}
+
+async fn cmd_print_config(config_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let cfg = load_config(config_path).await?;
+    println!("{}", serde_json::to_string_pretty(&cfg)?);
+    Ok(())
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// § 21  试炼 — 综合测试套件
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn echo(dim: usize) -> Arc<dyn EchoProvider> { Arc::new(DeterministicEcho::new(dim)) }
+    fn sled_store(path: &str) -> Arc<dyn AbyssStore> { Arc::new(SledAbyss::open(path).unwrap()) }
+
+    fn test_cfg(dim: usize, dir: &Path) -> ZhiHunConfig {
+        let mut c = ZhiHunConfig::default();
+        c.vector_dim = dim; c.hot_capacity = 100;
+        c.hnsw_m = 4; c.hnsw_ef_construction = 20; c.hnsw_ef_search = 10;
+        c.warm_db_path = String::new();
+        c.hnsw_index_path = dir.join("hnsw.bin").to_str().unwrap().into();
+        c.db_path = dir.join("sled").to_str().unwrap().into();
+        c.ttl_check_interval_secs = 3600;
+        c.index_save_interval_secs = 0;
+        c
+    }
+
+    // ── 向量工具 ──────────────────────────────────────────────────────────────
+
+    #[test] fn test_normalize_unit() { let v = normalize_vec(vec![3.0, 4.0]); assert!((vec_norm(&v) - 1.0).abs() < 1e-5); }
+    #[test] fn test_cosine_dist_opposite() { let v = normalize_vec(vec![1.0, 0.0]); assert!((cosine_dist(&v, &negate_vec(&v)) - 2.0).abs() < 1e-5); }
+    #[test] fn test_fnv1a_stable() { assert_eq!(fnv1a("hello"), fnv1a("hello")); assert_ne!(fnv1a("a"), fnv1a("b")); }
+    #[test] fn test_ordf32_ordering() { assert!(OrdF32(1.0) > OrdF32(0.5)); }
+
+    // ── MemoryBead + BeadMetadata ─────────────────────────────────────────────
+
+    #[test] fn test_bead_neg_vector() { let b = MemoryBead::new(vec![], vec![1.0, 0.0, 0.0], json!({})); assert!((b.neg_vector[0] + b.vector[0]).abs() < 1e-6); }
+    #[test] fn test_bead_not_expired() { assert!(!MemoryBead::new(vec![], vec![1.0, 0.0], json!({})).with_ttl(9999).is_expired()); }
+    #[test] fn test_bead_expired() { let mut b = MemoryBead::new(vec![], vec![1.0, 0.0], json!({})).with_ttl(1); b.created_at = 0; assert!(b.is_expired()); }
+    #[test] fn test_bead_meta_touch() { let mut b = MemoryBead::new(vec![], vec![1.0, 0.0], json!({})); b.bead_meta.touch(); b.bead_meta.touch(); assert_eq!(b.bead_meta.access_count, 2); }
+
+    // ── DeterministicEcho ────────────────────────────────────────────────────
+
+    #[tokio::test] async fn test_echo_reproducible() { let e = DeterministicEcho::new(32); assert_eq!(e.embed("hi").await.unwrap(), e.embed("hi").await.unwrap()); }
+    #[tokio::test] async fn test_echo_batch() {
+        let e = DeterministicEcho::new(32);
+        let s = vec![e.embed("cat").await.unwrap(), e.embed("dog").await.unwrap()];
+        let b = e.embed_batch(&["cat".into(), "dog".into()]).await.unwrap();
+        for (sv, bv) in s.iter().zip(b.iter()) { assert!(cosine_similarity(sv, bv) > 0.999); }
+    }
+
+    // ── HnswInner（自研HNSW）─────────────────────────────────────────────────
+
+    #[test] fn test_hnsw_basic() {
+        let mut h = HnswInner::new(4, 4, 20);
+        h.insert(0, normalize_vec(vec![1.0, 0.0, 0.0, 0.0])).unwrap();
+        h.insert(1, normalize_vec(vec![0.0, 1.0, 0.0, 0.0])).unwrap();
+        h.insert(2, normalize_vec(vec![0.0, 0.0, 1.0, 0.0])).unwrap();
+        let q = normalize_vec(vec![1.0, 0.0, 0.0, 0.0]);
+        let hits = h.search(&q, 1, 20);
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].0, 0, "最近邻应为label=0");
+    }
+
+    #[test] fn test_hnsw_dim_error() {
+        let mut h = HnswInner::new(4, 4, 20);
+        assert!(h.insert(0, vec![1.0, 2.0]).is_err());
+    }
+
+    #[test] fn test_star_sail_persist_reload() {
+        let tmp  = tempdir().unwrap();
+        let path = tmp.path().join("h.bin");
+        { let idx = StarSailIndex::new(3, path.to_str().unwrap(), 4, 20).unwrap(); idx.insert(42, normalize_vec(vec![1.0, 2.0, 3.0])).unwrap(); idx.persist().unwrap(); }
+        let idx2 = StarSailIndex::load_or_create(3, path.to_str().unwrap(), 4, 20).unwrap();
+        assert_eq!(idx2.search(&normalize_vec(vec![1.0, 2.0, 3.0]), 1, 20)[0].0, 42);
+    }
+
+    // ── PolarResonance ────────────────────────────────────────────────────────
+
+    #[test] fn test_polar_resonance_scores() {
+        let g  = Arc::new(ResonanceGraph::new(86400));
+        let pr = PolarResonance::new(g, 1.0, 0.8, 0.0);
+        let v  = normalize_vec(vec![1.0, 0.0]);
+        let same = MemoryBead::new(vec![], v.clone(), json!({}));
+        let opp  = MemoryBead::new(vec![], vec![-1.0, 0.0], json!({}));
+        let s_same = pr.score(&v, &same);
+        let s_opp  = pr.score(&v, &opp);
+        assert!(s_same > s_opp, "同向({:.4}) 应高于反向({:.4})", s_same, s_opp);
+        assert!(s_opp.abs() > 0.0, "ξ保证反向记忆可见");
+    }
+
+    // ── ResonanceGraph + EdgeType ─────────────────────────────────────────────
+
+    #[test] fn test_graph_symmetric() { let g = ResonanceGraph::new(86400); g.upsert("a", "b", 5, EdgeType::Causal); assert_eq!(g.top_neighbors("a", 1)[0].0, "b"); assert_eq!(g.top_neighbors("b", 1)[0].0, "a"); }
+    #[test] fn test_graph_edge_type_filter() {
+        let g = ResonanceGraph::new(86400);
+        g.upsert("a", "b", 3, EdgeType::Causal);
+        g.upsert("a", "c", 2, EdgeType::Semantic);
+        assert_eq!(g.neighbors_by_type("a", 10, &EdgeType::Causal).len(), 1);
+        assert_eq!(g.neighbors_by_type("a", 10, &EdgeType::Semantic).len(), 1);
+    }
+    #[test] fn test_graph_stats() { let g = ResonanceGraph::new(86400); g.upsert("a","b",1,EdgeType::Semantic); g.upsert("a","c",1,EdgeType::Causal); let s = g.stats(); assert_eq!(s.node_count, 3); assert!(s.avg_degree > 0.0); }
+    #[test] fn test_cache_stats_hit_rate() { let cs = CacheStats { hot_size: 0, warm_size: 0, hot_hits: 80, warm_hits: 10, cold_misses: 10 }; assert!((cs.hit_rate() - 0.9).abs() < 1e-6); }
+
+    // ── Sled 四树 ─────────────────────────────────────────────────────────────
+
+    #[tokio::test] async fn test_sled_bead_crud() {
+        let tmp = tempdir().unwrap();
+        let s   = SledAbyss::open(tmp.path().to_str().unwrap()).unwrap();
+        let b   = MemoryBead::new(vec!["t".into()], vec![1.0, 0.0], json!({"v":1}));
+        let id  = b.id.clone();
+        s.insert_bead(&b).await.unwrap();
+        assert!(s.get_bead(&id).await.unwrap().is_some());
+        assert!(s.delete_bead(&id).await.unwrap());
+        assert!(s.get_bead(&id).await.unwrap().is_none());
+    }
+
+    #[tokio::test] async fn test_sled_cooc_edge_type() {
+        let tmp = tempdir().unwrap();
+        let s   = SledAbyss::open(tmp.path().to_str().unwrap()).unwrap();
+        s.upsert_cooc("x", "y", 3, &EdgeType::Causal).await.unwrap();
+        s.upsert_cooc("x", "y", 2, &EdgeType::Causal).await.unwrap();
+        let co = s.load_cooc().await.unwrap();
+        let (cnt, et) = &co["x"]["y"];
+        assert_eq!(*cnt, 5);
+        assert_eq!(*et, EdgeType::Causal);
+    }
+
+    #[tokio::test] async fn test_sled_skill_name_index() {
+        let tmp = tempdir().unwrap();
+        let s   = SledAbyss::open(tmp.path().to_str().unwrap()).unwrap();
+        let payload = bincode::serialize(&SkillWeave::new("my_skill", vec![], vec![])).unwrap();
+        s.insert_skill_payload("s-001", "my_skill", &payload).await.unwrap();
+        assert_eq!(s.get_skill_id_by_name("my_skill").await.unwrap(), Some("s-001".to_string()));
+        // 级联删除
+        s.delete_skill("s-001").await.unwrap();
+        assert!(s.get_skill_payload("s-001").await.unwrap().is_none());
+        assert!(s.get_skill_id_by_name("my_skill").await.unwrap().is_none());
+    }
+
+    // ── FluxLearner 动量学习 ──────────────────────────────────────────────────
+
+    #[tokio::test] async fn test_flux_learner_momentum() {
+        let tmp = tempdir().unwrap();
+        let s   = sled_store(tmp.path().to_str().unwrap());
+        let c   = Arc::new(TieredCache::new(s, None, 100));
+        let b   = MemoryBead::new(vec![], vec![1.0, 0.0, 0.0, 0.0], json!({}));
+        let id  = b.id.clone();
+        c.insert(b).await.unwrap();
+        let learner = FluxLearner::new(c.clone(), 0.05, 0.90);
+        let fb = normalize_vec(vec![0.0, 1.0, 0.0, 0.0]);
+        learner.apply_feedback(&id, &fb).await.unwrap();
+        learner.apply_feedback(&id, &fb).await.unwrap();
+        let updated = c.get(&id).await.unwrap().unwrap();
+        assert_eq!(updated.version, 3, "两次反馈后版本应为3");
+        // 向量应向 fb 方向移动
+        assert!(updated.vector[1] > 0.0, "动量应使向量向fb方向移动");
+    }
+
+    // ── ForceSense ───────────────────────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_force_sense_skill() {
+        let tmp    = tempdir().unwrap();
+        let cfg    = test_cfg(32, tmp.path());
+        let s      = sled_store(&cfg.db_path);
+        let zh     = ZhiHun::new(cfg, s.clone(), echo(32)).await.unwrap();
+        let vault  = Arc::new(RwLock::new(SkillVault::new()));
+        let field  = Arc::new(ActionField::new());
+        let engine = Arc::new(ActionEngine::new(vault, field.clone(), zh.clone()));
+
+        let weave = SkillWeave::new("force_grasp",
+            vec![SkillPrimitive::ForceSense { params: json!({}) },
+                 SkillPrimitive::ArmControl { params: json!({"target": {"x": 0.1}}) }],
+            vec!["force".into()]).with_timeout(5000);
+        let bead = store_skill_weave(&zh, &weave).await.unwrap();
+        let r = engine.execute_by_id(&bead.id).await.unwrap();
+        assert!(r.is_object());
+        assert!(field.snapshot().contains_key("force_sense_reads"));
+        assert!(field.snapshot().contains_key("arm_control_executions"));
+    }
+
+    // ── 端到端集成 ────────────────────────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_e2e_full_pipeline() {
+        let tmp = tempdir().unwrap();
+        let cfg = test_cfg(32, tmp.path());
+        let s   = sled_store(&cfg.db_path);
+        let zh  = ZhiHun::new(cfg.clone(), s.clone(), echo(32)).await.unwrap();
+
+        // 插入互为镜像的技能
+        let id_r = zh.insert_text(vec!["right".into()], "grasp cup right", json!({}), None, None).await.unwrap();
+        let id_l = zh.insert_text(vec!["left".into()],  "grasp cup left",  json!({}), None, None).await.unwrap();
+
+        // 因果共现：右手→左手
+        zh.record_cooccurrence_typed(&id_r, &id_l, EdgeType::Causal).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // 查询：两个技能都应出现在结果中（ξ互补效果）
+        let results = zh.query_text("grasp cup", 4).await.unwrap();
+        assert!(!results.is_empty());
+
+        // 验证共现图（因果边）
+        let causal = zh.graph.neighbors_by_type(&id_r, 5, &EdgeType::Causal);
+        assert!(!causal.is_empty());
+        assert_eq!(causal[0].0, id_l);
+
+        // 验证 PageRank
+        let ppr = zh.graph.pagerank(&id_r, 5);
+        assert!(!ppr.is_empty());
+
+        // 动量反馈学习
+        let fb = echo(32).embed("grasp cup harder").await.unwrap();
+        zh.apply_feedback(&id_r, &fb).await.unwrap();
+        let updated = zh.get(&id_r).await.unwrap().unwrap();
+        assert!(updated.version > 1);
+
+        // 系统状态
+        let status = zh.status(0);
+        assert!(status.bead_count > 0);
+        assert!(status.graph.node_count > 0);
+        assert!(status.uptime_seconds < 60);
+
+        // 索引版本管理
+        let versions = zh.hnsw.list_versions();
+        assert!(!versions.is_empty());
+
+        // 删除
+        assert!(zh.delete(&id_r).await.unwrap());
+        assert!(zh.get(&id_r).await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_e2e_export_jsonl() {
+        let tmp = tempdir().unwrap();
+        let cfg = test_cfg(32, tmp.path());
+        let s   = sled_store(&cfg.db_path);
+        let zh  = ZhiHun::new(cfg, s.clone(), echo(32)).await.unwrap();
+
+        zh.insert_text(vec!["a".into()], "hello world", json!({}), None, None).await.unwrap();
+        zh.insert_text(vec!["b".into()], "foo bar",     json!({}), None, None).await.unwrap();
+
+        let out = tmp.path().join("export.jsonl");
+        let n   = zh.export_jsonl(&out).await.unwrap();
+        assert_eq!(n, 2);
+        let content = fs::read_to_string(&out).unwrap();
+        assert_eq!(content.lines().count(), 2);
+        for line in content.lines() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(v.get("id").is_some());
+            assert!(v.get("vector").is_some());
+        }
+    }
+
+    #[test] fn test_config_validate_cases() {
+        let mut c = ZhiHunConfig::default();
+        assert!(c.validate().is_ok());
+        c.vector_dim = 0;
+        assert!(c.validate().is_err());
+        c.vector_dim = 64; c.momentum = 1.5;
+        assert!(c.validate().is_err());
+        c.momentum = 0.9;
+        assert!(c.validate().is_ok());
+    }
+}
