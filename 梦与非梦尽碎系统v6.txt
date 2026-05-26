@@ -1,0 +1,4211 @@
+// ============================================================================
+// somniacta.rs
+// SOMNIACTA — Dream Shattering to New Dreams
+// 版权声明：本系统为原创独立作品。所有架构设计、算法实现和代码结构
+// 均为原创。
+// ============================================================================
+//
+// Cargo.toml:
+// [package]
+// name = "somniacta"
+// version = "1.0.0"
+// edition = "2021"
+//
+// [dependencies]
+// uuid = { version = "1", features = ["v4", "serde"] }
+// tokio = { version = "1", features = ["full"] }
+// dashmap = "6"
+// thiserror = "1"
+// tracing = "0.1"
+// rand = "0.8"
+// rand_distr = "0.4"
+// serde = { version = "1", features = ["derive"] }
+// serde_json = "1"
+// parking_lot = "0.12"
+// sled = "0.34"
+// bincode = "1"
+// hnsw = { version = "0.11", features = ["serde"] }
+// space = "0.17"
+// ndarray = { version = "0.15", optional = true }
+// prometheus = "0.13"
+// hyper = { version = "1", features = ["full"] }
+// http-body-util = "0.1"
+// hyper-util = { version = "0.1", features = ["full"] }
+// csv = "1.3"
+// chrono = "0.4"
+// anyhow = "1"
+// env_logger = "0.11"
+// log = "0.4"
+// ordered-float = "4"
+// bytes = "1"
+// tracing-subscriber = "0.3"
+//
+// [features]
+// default = []
+// onnx = ["ndarray"]
+//
+// resolver = "2"
+// ============================================================================
+
+use anyhow::Result as AnyhowResult;
+use bytes::Bytes;
+use csv::Writer;
+use dashmap::DashMap;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
+use log;
+use parking_lot::{Mutex, RwLock};
+use rand::prelude::*;
+use rand::rngs::StdRng;
+use rand_distr::{Distribution, Normal};
+use serde::{Deserialize, Serialize};
+use sled::Db;
+use space;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::convert::Infallible;
+use std::fmt;
+use std::fs::File;
+use std::io::Write;
+use std::net::SocketAddr;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use thiserror::Error;
+use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use uuid::Uuid;
+
+// ============================================================================
+// DREAM SHATTERS — 18 Shatters of the Dream — 18 fine-grained shatter variants
+// ============================================================================
+
+pub type NullResult<T> = Result<T, DreamShatter>;
+
+#[derive(Error, Debug)]
+pub enum DreamShatter {
+    #[error("Dream lost: {0}")]
+    DreamLost(Uuid),
+    #[error("Canvas overflow, current: {current}, max: {max}")]
+    CanvasOverflow { current: usize, max: usize },
+    #[error("Chamber lost: {0}")]
+    AtelierLost(Uuid),
+    #[error("Drawing ruptured at cycle {step}/{total}: {reason}")]
+    DrawingRuptured { step: usize, total: usize, reason: String },
+    #[error("Dimension mismatch: expected {expected}, actual {actual}")]
+    CanvasMismatch { expected: usize, actual: usize },
+    #[error("Dream faded: clarity {quality:.6} < summit {threshold:.6}")]
+    DreamFaded { quality: f64, threshold: f64 },
+    #[error("Retries spent after {attempts} calls")]
+    RetriesSpent { attempts: u32 },
+    #[error("Boundary void: {value:.6} outside [{min:.6}, {max:.6}]")]
+    CanvasEdgeVoid { value: f64, min: f64, max: f64 },
+    #[error("State aberration: {from} -> {to}")]
+    PhaseShatter { from: String, to: String },
+    #[error("Aether break: {0}")]
+    PaperBreak(String),
+    #[error("Mirror misaligned: {0}")]
+    PaletteMisaligned(String),
+    #[error("Specter timeout")]
+    SketchTimeout,
+    #[error("Energy dissolution: {energy:.6} > {threshold:.6}")]
+    InkDissolved { energy: f64, threshold: f64 },
+    #[error("Blank vector cannot enter the drawing")]
+    NullVector,
+    #[error("Archive corrupted: {0}")]
+    ArchiveCorrupted(String),
+    #[error("Muse silent: {0}")]
+    MuseSilent(String),
+    #[error("Merge ruptured: {0}")]
+    FusionRuptured(String),
+    #[error("Seal blocked: {0}")]
+    StrokeBlocked(String),
+}
+
+// ============================================================================
+// DREAM FRAGMENTS — Fragments of Perception
+// ============================================================================
+
+/// Recursive modality enum supporting single-mode and multi-modal composition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum PerceptionLayer {
+    Sight,
+    Touch,
+    Sound,
+    Kinesthesia,
+    Scent,
+    Synesthetic(Vec<PerceptionLayer>),
+}
+
+impl PerceptionLayer {
+    pub fn is_multimodal(&self) -> bool {
+        matches!(self, PerceptionLayer::Synesthetic(_))
+    }
+    pub fn contained_modalities(&self) -> Vec<PerceptionLayer> {
+        match self {
+            PerceptionLayer::Synesthetic(mods) => mods.clone(),
+            other => vec![other.clone()],
+        }
+    }
+}
+
+/// 7-dimensional sensory context for embodied intelligence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AmbientCanvas {
+    pub illumination_lux: f64,
+    pub color_temperature_kelvin: f64,
+    pub viewing_angle_degrees: [f64; 3],
+    pub distance_meters: f64,
+    pub ambient_noise_db: f64,
+    pub surface_temperature_celsius: f64,
+    pub humidity_percent: f64,
+}
+
+impl Default for AmbientCanvas {
+    fn default() -> Self {
+        Self {
+            illumination_lux: 500.0,
+            color_temperature_kelvin: 5600.0,
+            viewing_angle_degrees: [0.0, 0.0, 0.0],
+            distance_meters: 1.0,
+            ambient_noise_db: 30.0,
+            surface_temperature_celsius: 22.0,
+            humidity_percent: 45.0,
+        }
+    }
+}
+
+/// Core memory record with embedding, metadata, and decay support.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DreamFragment {
+    pub id: Uuid,
+    pub embedding: Vec<f64>,
+    pub feature_channels: HashMap<String, Vec<f64>>,
+    pub modality: PerceptionLayer,
+    pub context: AmbientCanvas,
+    pub confidence: f64,
+    pub origin_timestamp: SystemTime,
+    pub last_accessed: SystemTime,
+    pub access_count: u64,
+    pub decay_factor: f64,
+    pub source_agent_id: Uuid,
+    pub semantic_tags: Vec<String>,
+    pub dimensionality: usize,
+}
+
+impl DreamFragment {
+    pub fn new(
+        embedding: Vec<f64>,
+        modality: PerceptionLayer,
+        context: AmbientCanvas,
+        confidence: f64,
+        source_agent_id: Uuid,
+    ) -> Self {
+        let dimensionality = embedding.len();
+        let now = SystemTime::now();
+        Self {
+            id: Uuid::new_v4(),
+            embedding,
+            feature_channels: HashMap::new(),
+            modality,
+            context,
+            confidence: confidence.clamp(0.0, 1.0),
+            origin_timestamp: now,
+            last_accessed: now,
+            access_count: 0,
+            decay_factor: 0.999,
+            source_agent_id,
+            semantic_tags: Vec::new(),
+            dimensionality,
+        }
+    }
+
+    pub fn effective_confidence(&self) -> f64 {
+        let elapsed = self
+            .last_accessed
+            .elapsed()
+            .unwrap_or(Duration::ZERO)
+            .as_secs_f64();
+        self.confidence * self.decay_factor.powf(elapsed / 3600.0)
+    }
+
+    pub fn touch(&mut self) {
+        self.last_accessed = SystemTime::now();
+        self.access_count += 1;
+    }
+
+    pub fn decayed_embedding(&self) -> Vec<f64> {
+        let eff = self.effective_confidence();
+        self.embedding.iter().map(|v| v * eff).collect()
+    }
+
+    pub fn merge_feature_channels(&self, other: &DreamFragment) -> HashMap<String, Vec<f64>> {
+        let mut merged = self.feature_channels.clone();
+        for (key, other_vec) in &other.feature_channels {
+            let entry = merged
+                .entry(key.clone())
+                .or_insert_with(|| other_vec.clone());
+            if entry.len() == other_vec.len() {
+                for (i, v) in entry.iter_mut().enumerate() {
+                    *v = (*v + other_vec[i]) * 0.5;
+                }
+            }
+        }
+        merged
+    }
+
+    pub fn euclidean_norm(&self) -> f64 {
+        self.embedding.iter().map(|v| v * v).sum::<f64>().sqrt()
+    }
+
+    pub fn normalize(&self) -> Vec<f64> {
+        let norm = self.euclidean_norm();
+        if norm < 1e-15 {
+            return self.embedding.clone();
+        }
+        self.embedding.iter().map(|v| v / norm).collect()
+    }
+}
+
+// ============================================================================
+// SHATTER — Where Fragments Collide
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ShatterMode {
+    VisionClash,
+    SceneDrift,
+    Crossfire,
+    TimeRift,
+    MeaningBreak,
+    GridDistortion,
+}
+
+impl fmt::Display for ShatterMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum BreakDepth {
+    Hairline,
+    Fissure,
+    Rupture,
+    Shatter,
+}
+
+impl BreakDepth {
+    pub fn numeric_value(&self) -> f64 {
+        match self {
+            BreakDepth::Hairline => 0.25,
+            BreakDepth::Fissure => 0.5,
+            BreakDepth::Rupture => 0.75,
+            BreakDepth::Shatter => 1.0,
+        }
+    }
+}
+
+/// A detected shatter between two dream fragments.
+#[derive(Debug, Clone)]
+pub struct ShatteredPair {
+    pub id: Uuid,
+    pub fragment_a: Arc<DreamFragment>,
+    pub fragment_b: Arc<DreamFragment>,
+    pub shatter_mode: ShatterMode,
+    pub severity: BreakDepth,
+    pub detected_at: SystemTime,
+    pub resonance_score: f64,
+    pub fracture_dimensions: Vec<usize>,
+    pub dimensional_resonances: Vec<f64>,
+    pub metadata: HashMap<String, String>,
+}
+
+impl ShatteredPair {
+    pub fn new(
+        fragment_a: Arc<DreamFragment>,
+        fragment_b: Arc<DreamFragment>,
+        shatter_mode: ShatterMode,
+        resonance_score: f64,
+        fracture_dimensions: Vec<usize>,
+        dimensional_resonances: Vec<f64>,
+    ) -> Self {
+        let severity = Self::depth_from_resonance(resonance_score);
+        Self {
+            id: Uuid::new_v4(),
+            fragment_a,
+            fragment_b,
+            shatter_mode,
+            severity,
+            detected_at: SystemTime::now(),
+            resonance_score,
+            fracture_dimensions,
+            dimensional_resonances,
+            metadata: HashMap::new(),
+        }
+    }
+
+    pub fn depth_from_resonance(sim: f64) -> BreakDepth {
+        if sim < 0.15 {
+            BreakDepth::Shatter
+        } else if sim < 0.4 {
+            BreakDepth::Rupture
+        } else if sim < 0.7 {
+            BreakDepth::Fissure
+        } else {
+            BreakDepth::Hairline
+        }
+    }
+
+    pub fn fracture_dimension_ratio(&self) -> f64 {
+        let dim = self.fragment_a.dimensionality.max(1);
+        self.fracture_dimensions.len() as f64 / dim as f64
+    }
+
+    pub fn invariant_dimensions(&self) -> Vec<usize> {
+        self.dimensional_resonances
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| **s > 0.9)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn variant_dimensions(&self) -> Vec<usize> {
+        self.dimensional_resonances
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| **s <= 0.9)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn weighted_fracture_depth(&self) -> f64 {
+        let type_weight = match self.shatter_mode {
+            ShatterMode::VisionClash => 1.0,
+            ShatterMode::SceneDrift => 0.8,
+            ShatterMode::Crossfire => 1.2,
+            ShatterMode::TimeRift => 0.6,
+            ShatterMode::MeaningBreak => 1.1,
+            ShatterMode::GridDistortion => 1.3,
+        };
+        let severity_base = self.severity.numeric_value();
+        severity_base * type_weight * (1.0 + self.fracture_dimension_ratio())
+    }
+}
+
+// ============================================================================
+// REDREW ATELIERS — The Drawing Ateliers
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum CanvasPhase {
+    Blank,
+    Awakening,
+    Blending,
+    Agitating,
+    Crystallizing,
+    Verifying,
+    Transcended,
+    Dormant,
+    Crumpled,
+    Dissipated,
+}
+
+impl fmt::Display for CanvasPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AttemptOutcome {
+    Formed { quality: f64 },
+    Scattered { final_energy: f64 },
+    Stalled { energy: f64, steps: usize },
+    Unattained { achieved: f64, required: f64 },
+    Burnt { peak_energy: f64 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttemptRecord {
+    pub attempt_number: u32,
+    pub started_at: SystemTime,
+    pub completed_at: SystemTime,
+    pub final_energy: f64,
+    pub final_similarity: f64,
+    pub draw_cycles_completed: usize,
+    pub disturb_count: u32,
+    pub threshold_at_attempt: f64,
+    pub outcome: AttemptOutcome,
+    pub trajectory_digest: Vec<f64>,
+}
+
+/// Single redraw atelier managing the lifecycle of one shattered pair.
+#[derive(Debug, Clone)]
+pub struct RedrawAtelier {
+    pub id: Uuid,
+    pub shattered_pair: ShatteredPair,
+    pub state: CanvasPhase,
+    pub attempt_count: u32,
+    pub max_attempts: u32,
+    pub current_drawing: Option<DrawingState>,
+    pub best_drawing: Option<Vec<f64>>,
+    pub best_clarity: f64,
+    pub history: Vec<AttemptRecord>,
+    pub created_at: SystemTime,
+    pub last_attempt: Option<SystemTime>,
+    pub ttl: Duration,
+    pub priority: f64,
+    pub backoff_until: Option<SystemTime>,
+}
+
+impl RedrawAtelier {
+    pub fn new(
+        shattered_pair: ShatteredPair,
+        max_attempts: u32,
+        ttl: Duration,
+    ) -> Self {
+        let priority = shattered_pair.weighted_fracture_depth();
+        Self {
+            id: Uuid::new_v4(),
+            shattered_pair,
+            state: CanvasPhase::Blank,
+            attempt_count: 0,
+            max_attempts,
+            current_drawing: None,
+            best_drawing: None,
+            best_clarity: 0.0,
+            history: Vec::new(),
+            created_at: SystemTime::now(),
+            last_attempt: None,
+            ttl,
+            priority,
+            backoff_until: None,
+        }
+    }
+
+    /// Transition to a new atelier state with full validation of the 17 transition rules.
+    pub fn transition_to(&mut self, target: CanvasPhase) -> NullResult<()> {
+        if self.is_expired() && target != CanvasPhase::Dissipated {
+            self.state = CanvasPhase::Dissipated;
+            return Err(DreamShatter::PhaseShatter {
+                from: "Dissipated(auto)".into(),
+                to: format!("{:?}", target),
+            });
+        }
+
+        let legal = matches!(
+            (&self.state, &target),
+            (CanvasPhase::Blank, CanvasPhase::Awakening)
+                | (CanvasPhase::Awakening, CanvasPhase::Blending)
+                | (CanvasPhase::Blending, CanvasPhase::Agitating)
+                | (CanvasPhase::Blending, CanvasPhase::Crystallizing)
+                | (CanvasPhase::Blending, CanvasPhase::Crumpled)
+                | (CanvasPhase::Agitating, CanvasPhase::Blending)
+                | (CanvasPhase::Agitating, CanvasPhase::Crystallizing)
+                | (CanvasPhase::Agitating, CanvasPhase::Crumpled)
+                | (CanvasPhase::Crystallizing, CanvasPhase::Verifying)
+                | (CanvasPhase::Crystallizing, CanvasPhase::Blending)
+                | (CanvasPhase::Verifying, CanvasPhase::Transcended)
+                | (CanvasPhase::Verifying, CanvasPhase::Dormant)
+                | (CanvasPhase::Verifying, CanvasPhase::Crumpled)
+                | (CanvasPhase::Dormant, CanvasPhase::Awakening)
+                | (_, CanvasPhase::Dissipated)
+        );
+
+        if !legal {
+            return Err(DreamShatter::PhaseShatter {
+                from: format!("{:?}", self.state),
+                to: format!("{:?}", target),
+            });
+        }
+
+        self.state = target;
+        Ok(())
+    }
+
+    pub fn is_redrawable(&self) -> bool {
+        self.attempt_count < self.max_attempts
+            && !self.is_expired()
+            && self.is_dormancy_complete()
+            && matches!(
+                self.state,
+                CanvasPhase::Dormant | CanvasPhase::Blank | CanvasPhase::Awakening
+            )
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.created_at
+            .elapsed()
+            .map(|d| d >= self.ttl)
+            .unwrap_or(false)
+    }
+
+    pub fn record_attempt(
+        &mut self,
+        final_energy: f64,
+        final_similarity: f64,
+        steps_completed: usize,
+        disturb_count: u32,
+        threshold: f64,
+        outcome: AttemptOutcome,
+        trajectory_digest: Vec<f64>,
+        started_at: SystemTime,
+    ) {
+        let attempt = AttemptRecord {
+            attempt_number: self.attempt_count,
+            started_at,
+            completed_at: SystemTime::now(),
+            final_energy,
+            final_similarity,
+            draw_cycles_completed: steps_completed,
+            disturb_count,
+            threshold_at_attempt: threshold,
+            outcome,
+            trajectory_digest,
+        };
+        self.history.push(attempt);
+        self.last_attempt = Some(SystemTime::now());
+        self.attempt_count += 1;
+    }
+
+    pub fn update_best_drawing(&mut self, candidate: Vec<f64>, quality: f64) {
+        if quality > self.best_clarity {
+            self.best_clarity = quality;
+            self.best_drawing = Some(candidate);
+        }
+    }
+
+    pub fn compute_priority(&self) -> f64 {
+        let severity = self.shattered_pair.weighted_fracture_depth();
+        let age_hours = self
+            .created_at
+            .elapsed()
+            .unwrap_or(Duration::ZERO)
+            .as_secs_f64()
+            / 3600.0;
+        let attempt_penalty = 1.0 / (1.0 + self.attempt_count as f64 * 0.3);
+        let quality_bonus = self.best_clarity * 0.5;
+        severity * (1.0 + age_hours * 0.1) * attempt_penalty + quality_bonus
+    }
+
+    pub fn elapsed_since_creation(&self) -> Duration {
+        self.created_at.elapsed().unwrap_or(Duration::ZERO)
+    }
+
+    pub fn backoff_duration(&self) -> Duration {
+        let base_ms: u64 = 500;
+        let exp = base_ms.saturating_mul(1u64 << self.attempt_count.min(12));
+        let jitter_range = (exp as f64 * 0.25) as u64;
+        let jitter = if jitter_range > 0 {
+            rand::thread_rng().gen_range(0..=jitter_range)
+        } else {
+            0
+        };
+        Duration::from_millis(exp.saturating_add(jitter))
+    }
+
+    pub fn enter_dormancy(&mut self) {
+        let dur = self.backoff_duration();
+        self.backoff_until = Some(SystemTime::now() + dur);
+    }
+
+    pub fn is_dormancy_complete(&self) -> bool {
+        match self.backoff_until {
+            None => true,
+            Some(until) => SystemTime::now() >= until,
+        }
+    }
+}
+
+// ============================================================================
+// DRAWING STATE — Strokes of the Drawing
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StrokePoint {
+    pub step: usize,
+    pub vector_snapshot: Vec<f64>,
+    pub energy: f64,
+    pub alpha: f64,
+    pub gradient_magnitude: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrawingState {
+    pub step: usize,
+    pub total_steps: usize,
+    pub current_vector: Vec<f64>,
+    pub alpha: f64,
+    pub energy: f64,
+    pub previous_energy: f64,
+    pub gradient: Vec<f64>,
+    pub trajectory: Vec<StrokePoint>,
+    pub momentum: Vec<f64>,
+    pub learning_rate: f64,
+    pub disturb_count: u32,
+    pub stagnation_counter: u32,
+    pub best_energy: f64,
+    pub best_vector: Vec<f64>,
+    pub convergence_history: Vec<f64>,
+    pub dimensionality: usize,
+}
+
+impl DrawingState {
+    pub fn new(dimensionality: usize, total_steps: usize) -> Self {
+        Self {
+            step: 0,
+            total_steps,
+            current_vector: vec![0.0; dimensionality],
+            alpha: 0.5,
+            energy: f64::MAX,
+            previous_energy: f64::MAX,
+            gradient: vec![0.0; dimensionality],
+            trajectory: Vec::with_capacity(total_steps / 10 + 1),
+            momentum: vec![0.0; dimensionality],
+            learning_rate: 0.01,
+            disturb_count: 0,
+            stagnation_counter: 0,
+            best_energy: f64::MAX,
+            best_vector: vec![0.0; dimensionality],
+            convergence_history: Vec::with_capacity(total_steps),
+            dimensionality,
+        }
+    }
+
+    pub fn advance_step(&mut self) {
+        let gm = self.gradient_magnitude();
+        let point = StrokePoint {
+            step: self.step,
+            vector_snapshot: if self.step % 10 == 0 {
+                self.current_vector.clone()
+            } else {
+                Vec::new()
+            },
+            energy: self.energy,
+            alpha: self.alpha,
+            gradient_magnitude: gm,
+        };
+        self.trajectory.push(point);
+        self.convergence_history.push(self.energy);
+        self.step += 1;
+    }
+
+    pub fn update_vector(&mut self, new_vector: Vec<f64>) {
+        self.previous_energy = self.energy;
+        self.current_vector = new_vector;
+    }
+
+    pub fn apply_momentum(&mut self, beta: f64) {
+        for i in 0..self.dimensionality {
+            self.momentum[i] =
+                beta * self.momentum[i] + (1.0 - beta) * self.gradient[i];
+            self.current_vector[i] -= self.learning_rate * self.momentum[i];
+        }
+    }
+
+    pub fn is_stagnating(&self, patience: usize) -> bool {
+        self.stagnation_counter as usize >= patience
+    }
+
+    pub fn energy_delta(&self) -> f64 {
+        self.energy - self.previous_energy
+    }
+
+    pub fn gradient_magnitude(&self) -> f64 {
+        self.gradient.iter().map(|g| g * g).sum::<f64>().sqrt()
+    }
+
+    pub fn has_converged(&self, epsilon: f64) -> bool {
+        self.gradient_magnitude() < epsilon
+    }
+
+    pub fn progress_ratio(&self) -> f64 {
+        if self.total_steps == 0 {
+            return 1.0;
+        }
+        self.step as f64 / self.total_steps as f64
+    }
+
+    pub fn reset_for_attempt(&mut self) {
+        self.step = 0;
+        self.current_vector = self.best_vector.clone();
+        self.energy = self.best_energy;
+        self.previous_energy = f64::MAX;
+        self.gradient = vec![0.0; self.dimensionality];
+        self.trajectory.clear();
+        self.momentum = vec![0.0; self.dimensionality];
+        self.stagnation_counter = 0;
+        self.convergence_history.clear();
+        self.disturb_count = 0;
+    }
+
+    /// Adaptive learning rate based on convergence history trend.
+    /// Adaptive learning rate with oscillation detection.
+    pub fn adaptive_learning_rate(&mut self) {
+        if self.convergence_history.len() < 3 {
+            return;
+        }
+        let len = self.convergence_history.len();
+        let d1 = self.convergence_history[len - 1] - self.convergence_history[len - 2];
+        let d2 = self.convergence_history[len - 2] - self.convergence_history[len - 3];
+
+        if d1 > 0.0 && d2 > 0.0 {
+            self.learning_rate *= 0.7;
+        } else if d1 < 0.0 && d2 < 0.0 {
+            self.learning_rate *= 1.05;
+        } else if (d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0) {
+            self.learning_rate *= 0.85;
+        }
+        self.learning_rate = self.learning_rate.clamp(1e-7, 1.0);
+    }
+}
+
+// ============================================================================
+// REDRAWN MEMORIES — Memories That Were Redrawn
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedrawLineage {
+    pub shatter_mode: ShatterMode,
+    pub initial_similarity: f64,
+    pub final_similarity_to_a: f64,
+    pub final_similarity_to_b: f64,
+    pub threshold_at_acceptance: f64,
+    pub trajectory_energy_digest: Vec<f64>,
+    pub strategy_used: String,
+    pub agitator_used: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedrawnMemory {
+    pub id: Uuid,
+    pub unified_embedding: Vec<f64>,
+    pub source_shatter_ids: Vec<Uuid>,
+    pub source_fragment_ids: Vec<Uuid>,
+    pub redraw_quality: f64,
+    pub invariant_dimensions: Vec<usize>,
+    pub variant_dimensions: Vec<usize>,
+    pub dimensional_confidence: Vec<f64>,
+    pub meta_features: HashMap<String, f64>,
+    pub draw_alpha: f64,
+    pub total_attempts_consumed: u32,
+    pub total_disturbs_applied: u32,
+    pub energy_at_redraw: f64,
+    pub created_at: SystemTime,
+    pub lineage: RedrawLineage,
+}
+
+impl RedrawnMemory {
+    pub fn to_dream_fragment(&self, agent_id: Uuid) -> DreamFragment {
+        DreamFragment {
+            id: Uuid::new_v4(),
+            embedding: self.unified_embedding.clone(),
+            feature_channels: HashMap::new(),
+            modality: PerceptionLayer::Synesthetic(vec![PerceptionLayer::Sight]),
+            context: AmbientCanvas::default(),
+            confidence: self.redraw_quality,
+            origin_timestamp: self.created_at,
+            last_accessed: SystemTime::now(),
+            access_count: 0,
+            decay_factor: 0.9995,
+            source_agent_id: agent_id,
+            semantic_tags: vec!["transcended".into()],
+            dimensionality: self.unified_embedding.len(),
+        }
+    }
+
+    pub fn invariant_ratio(&self) -> f64 {
+        let total = self.invariant_dimensions.len() + self.variant_dimensions.len();
+        if total == 0 {
+            return 0.0;
+        }
+        self.invariant_dimensions.len() as f64 / total as f64
+    }
+
+    pub fn balance_score(&self) -> f64 {
+        let sim_a = self.lineage.final_similarity_to_a;
+        let sim_b = self.lineage.final_similarity_to_b;
+        let max_sim = sim_a.max(sim_b);
+        if max_sim < 1e-15 {
+            return 0.0;
+        }
+        sim_a.min(sim_b) / max_sim
+    }
+
+    pub fn validate_coherence(&self) -> bool {
+        let has_nan_inf = self
+            .unified_embedding
+            .iter()
+            .any(|v| v.is_nan() || v.is_infinite());
+        if has_nan_inf {
+            return false;
+        }
+        let norm: f64 = self
+            .unified_embedding
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        norm > 1e-12
+    }
+}
+
+// ============================================================================
+// CORE TRAITS — Six Core Traits
+// ============================================================================
+
+pub trait HarmonyMetric: Send + Sync {
+    fn compute(&self, a: &[f64], b: &[f64]) -> Option<f64>;
+    fn compute_cached(&self, a: &[f64], b: &[f64]) -> Option<f64> {
+        self.compute(a, b)
+    }
+}
+
+pub trait ShatterDetector: Send + Sync {
+    fn detect(&self, existing: &DreamFragment, incoming: &DreamFragment) -> NullResult<Option<ShatteredPair>>;
+}
+
+pub trait DrawingStrategy: Send + Sync {
+    fn interpolate(
+        &self,
+        first_embedding: &[f64],
+        second_embedding: &[f64],
+        draw_alpha: f64,
+    ) -> NullResult<Vec<f64>>;
+}
+
+pub trait Disturber: Send + Sync {
+    fn perturb(
+        &self,
+        base_embedding: &[f64],
+        step_index: usize,
+        total_steps: usize,
+    ) -> NullResult<Vec<f64>>;
+
+    fn name(&self) -> &'static str;
+
+    fn dimensionally_safe(&self, base_embedding: &[f64], output: &[f64]) -> bool {
+        if base_embedding.len() != output.len() {
+            return false;
+        }
+        output.iter().all(|v| !v.is_nan() && !v.is_infinite())
+    }
+}
+
+pub trait RedrawPolicy: Send + Sync {
+    fn should_transcend(
+        &self,
+        shattered_pair: &ShatteredPair,
+        interpolation_state: &DrawingState,
+        current_quality: f64,
+        acceptance_threshold: f64,
+    ) -> bool;
+
+    fn compute_acceptance_threshold(
+        &self,
+        attempt_number: u32,
+        max_attempts: u32,
+    ) -> f64;
+}
+
+pub trait Critic: Send + Sync {
+    fn score(&self, candidate_embedding: &[f64], reference_embedding: &[f64]) -> f64;
+
+    fn accept(
+        &self,
+        candidate_embedding: &[f64],
+        reference_embedding: &[f64],
+    ) -> bool {
+        self.score(candidate_embedding, reference_embedding) >= 0.5
+    }
+
+    fn name(&self) -> &'static str {
+        "UnnamedCritic"
+    }
+}
+
+// ============================================================================
+// HARMONY — Echoes of Harmony
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct HarmonicEcho;
+
+impl HarmonyMetric for HarmonicEcho {
+    fn compute(&self, a: &[f64], b: &[f64]) -> Option<f64> {
+        if a.is_empty() || b.is_empty() || a.len() != b.len() {
+            return None;
+        }
+        let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let norm_a: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let norm_b: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let denom = norm_a * norm_b;
+        if denom < 1e-15 {
+            return None;
+        }
+        let sim = (dot / denom).clamp(-1.0, 1.0);
+        Some((sim + 1.0) / 2.0)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SpatialEcho;
+
+impl HarmonyMetric for SpatialEcho {
+    fn compute(&self, a: &[f64], b: &[f64]) -> Option<f64> {
+        if a.is_empty() || b.is_empty() || a.len() != b.len() {
+            return None;
+        }
+        let dist: f64 = a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum::<f64>().sqrt();
+        let max_dist = (a.len() as f64).sqrt();
+        let scaled = dist / max_dist.max(1e-15);
+        Some((1.0 - scaled).clamp(0.0, 1.0))
+    }
+}
+
+pub struct PolyphonicEcho {
+    pub weights: Vec<f64>,
+    pub metrics: Vec<Arc<dyn HarmonyMetric>>,
+}
+
+impl std::fmt::Debug for PolyphonicEcho {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PolyphonicEcho")
+            .field("weights", &self.weights)
+            .field("metric_count", &self.metrics.len())
+            .finish()
+    }
+}
+
+impl Clone for PolyphonicEcho {
+    fn clone(&self) -> Self {
+        Self {
+            weights: self.weights.clone(),
+            metrics: self.metrics.clone(),
+        }
+    }
+}
+
+impl PolyphonicEcho {
+    pub fn new() -> Self {
+        Self {
+            weights: Vec::new(),
+            metrics: Vec::new(),
+        }
+    }
+    pub fn add_metric(&mut self, weight: f64, metric: Arc<dyn HarmonyMetric>) {
+        self.weights.push(weight);
+        self.metrics.push(metric);
+    }
+    pub fn normalize_weights(&mut self) {
+        let total: f64 = self.weights.iter().sum();
+        if total > 1e-15 {
+            self.weights.iter_mut().for_each(|w| *w /= total);
+        }
+    }
+}
+
+impl Default for PolyphonicEcho {
+    fn default() -> Self {
+        let mut m = Self::new();
+        m.add_metric(0.7, Arc::new(HarmonicEcho));
+        m.add_metric(0.3, Arc::new(SpatialEcho));
+        m.normalize_weights();
+        m
+    }
+}
+
+impl HarmonyMetric for PolyphonicEcho {
+    fn compute(&self, a: &[f64], b: &[f64]) -> Option<f64> {
+        if self.weights.is_empty() {
+            return None;
+        }
+        let mut weighted_sum = 0.0;
+        let mut valid_count = 0u32;
+        for (w, metric) in self.weights.iter().zip(self.metrics.iter()) {
+            if let Some(sim) = metric.compute(a, b) {
+                weighted_sum += w * sim;
+                valid_count += 1;
+            }
+        }
+        if valid_count == 0 {
+            return None;
+        }
+        Some(weighted_sum.clamp(0.0, 1.0))
+    }
+}
+
+// ============================================================================
+// DRAWING CRAFT — Techniques of Drawing
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct ArcDraw;
+
+impl ArcDraw {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl DrawingStrategy for ArcDraw {
+    fn interpolate(
+        &self,
+        first_embedding: &[f64],
+        second_embedding: &[f64],
+        draw_alpha: f64,
+    ) -> NullResult<Vec<f64>> {
+        let dim = first_embedding.len();
+        if dim == 0 || dim != second_embedding.len() {
+            return Err(DreamShatter::CanvasMismatch {
+                expected: dim,
+                actual: second_embedding.len(),
+            });
+        }
+        let dot: f64 = first_embedding
+            .iter()
+            .zip(second_embedding.iter())
+            .map(|(a, b)| a * b)
+            .sum();
+        let norm_a: f64 = first_embedding.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let norm_b: f64 = second_embedding.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let denom = norm_a * norm_b;
+        if denom < 1e-15 {
+            return Ok(first_embedding.iter().zip(second_embedding).map(|(a, b)| (a + b) * 0.5).collect());
+        }
+        let cos_theta = (dot / denom).clamp(-1.0, 1.0);
+        let theta = cos_theta.acos();
+        let alpha = draw_alpha.clamp(0.0, 1.0);
+        let sin_theta = theta.sin();
+        let mut result = vec![0.0; dim];
+        if sin_theta < 1e-15 {
+            for i in 0..dim {
+                result[i] = first_embedding[i] * (1.0 - alpha) + second_embedding[i] * alpha;
+            }
+        } else {
+            let w1 = ((1.0 - alpha) * theta).sin() / sin_theta;
+            let w2 = (alpha * theta).sin() / sin_theta;
+            for i in 0..dim {
+                result[i] = first_embedding[i] * w1 + second_embedding[i] * w2;
+            }
+        }
+        Ok(result)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FluxDraw {
+    pub base_alpha: f64,
+    pub energy_factor: f64,
+}
+
+impl FluxDraw {
+    pub fn new(base_alpha: f64, energy_factor: f64) -> Self {
+        Self {
+            base_alpha: base_alpha.clamp(0.0, 1.0),
+            energy_factor,
+        }
+    }
+}
+
+impl DrawingStrategy for FluxDraw {
+    fn interpolate(
+        &self,
+        first_embedding: &[f64],
+        second_embedding: &[f64],
+        draw_alpha: f64,
+    ) -> NullResult<Vec<f64>> {
+        let dim = first_embedding.len();
+        if dim == 0 || dim != second_embedding.len() {
+            return Err(DreamShatter::CanvasMismatch {
+                expected: dim,
+                actual: second_embedding.len(),
+            });
+        }
+        let energy_a: f64 = first_embedding.iter().map(|v| v.abs()).sum::<f64>() / dim.max(1) as f64;
+        let energy_b: f64 = second_embedding.iter().map(|v| v.abs()).sum::<f64>() / dim.max(1) as f64;
+        let alpha = draw_alpha.clamp(0.0, 1.0);
+        let energy_ratio = energy_a / (energy_b.max(1e-15));
+        let adjusted_alpha = (alpha * self.energy_factor * energy_ratio)
+            .clamp(0.0, 1.0)
+            .max(self.base_alpha * 0.5)
+            .min(self.base_alpha * 1.5 + 0.5);
+        Ok(first_embedding
+            .iter()
+            .zip(second_embedding.iter())
+            .map(|(a, b)| a * (1.0 - adjusted_alpha) + b * adjusted_alpha)
+            .collect())
+    }
+}
+
+// ============================================================================
+// DISTURBERS — Six Forces of Disturbance
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct MistDisturber {
+    pub sigma: f64,
+    pub decay_rate: f64,
+}
+
+impl MistDisturber {
+    pub fn new(sigma: f64, decay_rate: f64) -> Self {
+        Self { sigma, decay_rate }
+    }
+}
+
+fn draw_from_chaos(rng: &mut impl Rng) -> f64 {
+    let u1: f64 = rng.gen();
+    let u2: f64 = rng.gen();
+    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+}
+
+impl Disturber for MistDisturber {
+    fn perturb(
+        &self,
+        base_embedding: &[f64],
+        step_index: usize,
+        _total_steps: usize,
+    ) -> NullResult<Vec<f64>> {
+        let decay = (self.decay_rate * step_index as f64).exp();
+        let effective_sigma = self.sigma / decay.max(1e-15);
+        let mut rng = rand::thread_rng();
+        let perturbed: Vec<f64> = base_embedding
+            .iter()
+            .map(|v| v + draw_from_chaos(&mut rng) * effective_sigma)
+            .collect();
+        if self.dimensionally_safe(base_embedding, &perturbed) {
+            Ok(perturbed)
+        } else {
+            Err(DreamShatter::DrawingRuptured {
+                step: step_index,
+                total: 0,
+                reason: "Mist disturbance produced invalid values".into(),
+            })
+        }
+    }
+    fn name(&self) -> &'static str {
+        "Mist"
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GridDisturber {
+    pub block_count: usize,
+    pub agitation_probability: f64,
+}
+
+impl GridDisturber {
+    pub fn new(block_count: usize, agitation_probability: f64) -> Self {
+        Self {
+            block_count: block_count.max(1),
+            agitation_probability: agitation_probability.clamp(0.0, 1.0),
+        }
+    }
+}
+
+impl Disturber for GridDisturber {
+    fn perturb(
+        &self,
+        base_embedding: &[f64],
+        step_index: usize,
+        _total_steps: usize,
+    ) -> NullResult<Vec<f64>> {
+        let dim = base_embedding.len();
+        if dim == 0 {
+            return Err(DreamShatter::CanvasMismatch {
+                expected: 1,
+                actual: 0,
+            });
+        }
+        let block_size = dim / self.block_count.max(1);
+        let mut rng = rand::thread_rng();
+        let mut result = base_embedding.to_vec();
+        let block_to_perturb = step_index % self.block_count;
+        let start = block_to_perturb * block_size;
+        let end = ((block_to_perturb + 1) * block_size).min(dim);
+        let normal = Normal::new(0.0, 0.02).map_err(|e| {
+            DreamShatter::PaletteMisaligned(format!("Normal distribution error: {}", e))
+        })?;
+        for i in start..end {
+            if rng.gen::<f64>() < self.agitation_probability {
+                let noise = normal.sample(&mut rng);
+                result[i] += noise;
+            }
+        }
+        Ok(result)
+    }
+    fn name(&self) -> &'static str {
+        "Lattice"
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FlowDisturber {
+    pub gradient_influence: f64,
+}
+
+impl FlowDisturber {
+    pub fn new(gradient_influence: f64) -> Self {
+        Self { gradient_influence }
+    }
+}
+
+impl Disturber for FlowDisturber {
+    fn perturb(
+        &self,
+        base_embedding: &[f64],
+        step_index: usize,
+        total_steps: usize,
+    ) -> NullResult<Vec<f64>> {
+        if base_embedding.is_empty() {
+            return Err(DreamShatter::NullVector);
+        }
+        let dim = base_embedding.len();
+        let magnitude: f64 = base_embedding.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let norm: Vec<f64> = base_embedding
+            .iter()
+            .map(|v| if magnitude > 1e-15 { *v / magnitude } else { *v })
+            .collect();
+        let progress = step_index as f64 / total_steps.max(1) as f64;
+        let mut rng = rand::thread_rng();
+        let noise_strength = (1.0 - progress) * self.gradient_influence;
+        let perturbed: Vec<f64> = norm
+            .iter()
+            .map(|v| v + (rng.gen::<f64>() - 0.5) * noise_strength * 2.0)
+            .collect();
+        let mut rescaled = vec![0.0; dim];
+        for i in 0..dim {
+            rescaled[i] = perturbed[i] * magnitude;
+        }
+        if self.dimensionally_safe(base_embedding, &rescaled) {
+            Ok(rescaled)
+        } else {
+            Err(DreamShatter::DrawingRuptured {
+                step: step_index,
+                total: total_steps,
+                reason: "Flow disturbance diverged".into(),
+            })
+        }
+    }
+    fn name(&self) -> &'static str {
+        "Current"
+    }
+}
+
+// ============================================================================
+// 10 continued. SenseDisturber — brightness perturbation + mist blurring
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct SenseDisturber {
+    pub brightness_range: (f64, f64),
+    pub smooth_window: usize,
+}
+
+impl SenseDisturber {
+    pub fn new(brightness_range: (f64, f64), smooth_window: usize) -> Self {
+        Self {
+            brightness_range,
+            smooth_window: smooth_window.max(1),
+        }
+    }
+
+    fn soften(data: &mut [f64], window: usize) {
+        let n = data.len();
+        if n == 0 || window == 0 {
+            return;
+        }
+        let half = window / 2;
+        let tmp: Vec<f64> = data.to_vec();
+        for i in 0..n {
+            let start = i.saturating_sub(half);
+            let end = (i + half + 1).min(n);
+            let slice = &tmp[start..end];
+            let sum: f64 = slice.iter().sum();
+            let avg = sum / slice.len().max(1) as f64;
+            data[i] = avg;
+        }
+    }
+}
+
+impl Disturber for SenseDisturber {
+    fn perturb(
+        &self,
+        base_embedding: &[f64],
+        _step_index: usize,
+        _total_steps: usize,
+    ) -> NullResult<Vec<f64>> {
+        let mut rng = rand::thread_rng();
+        let brightness = rng.gen_range(self.brightness_range.0..self.brightness_range.1);
+        let scale = 1.0 + (brightness - 500.0) / 5000.0;
+        let mut v: Vec<f64> = base_embedding.iter().map(|x| x * scale).collect();
+        Self::soften(&mut v, self.smooth_window);
+        Ok(v)
+    }
+    fn name(&self) -> &'static str {
+        "Sense"
+    }
+}
+
+// ============================================================================
+// 10 continued. MaskDisturber — spatial block masking
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct MaskDisturber {
+    pub block_ratio: f64,
+    pub attenuation_range: (f64, f64),
+}
+
+impl MaskDisturber {
+    pub fn new(block_ratio: f64, attenuation_range: (f64, f64)) -> Self {
+        Self {
+            block_ratio: block_ratio.clamp(0.01, 0.99),
+            attenuation_range,
+        }
+    }
+}
+
+impl Disturber for MaskDisturber {
+    fn perturb(
+        &self,
+        base_embedding: &[f64],
+        _step_index: usize,
+        _total_steps: usize,
+    ) -> NullResult<Vec<f64>> {
+        let dim = base_embedding.len();
+        if dim == 0 {
+            return Err(DreamShatter::CanvasMismatch {
+                expected: 1,
+                actual: 0,
+            });
+        }
+        let mut rng = rand::thread_rng();
+        let block_size = ((dim as f64 * self.block_ratio) as usize).max(1).min(dim);
+        let block_start = rng.gen_range(0..dim.saturating_sub(block_size).max(1));
+        let mut result = base_embedding.to_vec();
+        for i in block_start..(block_start + block_size).min(dim) {
+            let attenuation = rng.gen_range(self.attenuation_range.0..self.attenuation_range.1);
+            result[i] *= attenuation;
+        }
+        Ok(result)
+    }
+    fn name(&self) -> &'static str {
+        "Mask"
+    }
+}
+
+// ============================================================================
+// 10 continued. ShiftDisturber — spatial shift + zero-fill
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct ShiftDisturber {
+    pub max_shift_ratio: f64,
+}
+
+impl ShiftDisturber {
+    pub fn new(max_shift_ratio: f64) -> Self {
+        Self {
+            max_shift_ratio: max_shift_ratio.clamp(0.0, 0.5),
+        }
+    }
+}
+
+impl Disturber for ShiftDisturber {
+    fn perturb(
+        &self,
+        base_embedding: &[f64],
+        _step_index: usize,
+        _total_steps: usize,
+    ) -> NullResult<Vec<f64>> {
+        let dim = base_embedding.len();
+        if dim == 0 {
+            return Err(DreamShatter::CanvasMismatch {
+                expected: 1,
+                actual: 0,
+            });
+        }
+        let mut rng = rand::thread_rng();
+        let shift = rng.gen_range(-self.max_shift_ratio..self.max_shift_ratio);
+        let offset = (shift * dim as f64).round() as isize;
+        let mut result = vec![0.0; dim];
+        for i in 0..dim {
+            let src = i as isize - offset;
+            if src >= 0 && (src as usize) < dim {
+                result[i] = base_embedding[src as usize];
+            }
+        }
+        Ok(result)
+    }
+    fn name(&self) -> &'static str {
+        "Parallax"
+    }
+}
+
+// ============================================================================
+// DREAM BREAK DETECTOR — Sensing the Breaks
+// ============================================================================
+
+pub struct DreamBreakDetector {
+    pub metric: Arc<dyn HarmonyMetric>,
+    pub visual_threshold: f64,
+    pub contextual_threshold: f64,
+    pub temporal_threshold: f64,
+    pub semantic_threshold: f64,
+}
+
+impl DreamBreakDetector {
+    pub fn new(
+        metric: Arc<dyn HarmonyMetric>,
+        visual_threshold: f64,
+        contextual_threshold: f64,
+    ) -> Self {
+        Self {
+            metric,
+            visual_threshold: visual_threshold.clamp(0.0, 1.0),
+            contextual_threshold: contextual_threshold.clamp(0.0, 1.0),
+            temporal_threshold: 0.3,
+            semantic_threshold: 0.5,
+        }
+    }
+}
+
+impl ShatterDetector for DreamBreakDetector {
+    fn detect(
+        &self,
+        existing: &DreamFragment,
+        incoming: &DreamFragment,
+    ) -> NullResult<Option<ShatteredPair>> {
+        let sim = self
+            .metric
+            .compute(&existing.embedding, &incoming.embedding)
+            .unwrap_or(1.0);
+
+        let mut fracture_dimensions: Vec<usize> = Vec::new();
+        let mut dimensional_resonances: Vec<f64> = Vec::new();
+        let dim = existing.dimensionality.max(incoming.dimensionality).max(1);
+        for i in 0..dim {
+            let a_val = existing.embedding.get(i).copied().unwrap_or(0.0);
+            let b_val = incoming.embedding.get(i).copied().unwrap_or(0.0);
+            let d_sim = 1.0 - (a_val - b_val).abs();
+            dimensional_resonances.push(d_sim);
+            if d_sim < self.visual_threshold {
+                fracture_dimensions.push(i);
+            }
+        }
+
+        let mut shatter_mode = ShatterMode::GridDistortion;
+        let mut severity = ShatteredPair::depth_from_resonance(sim);
+
+        // HashSet semantic tag comparison
+        let existing_tags: HashSet<String> =
+            existing.semantic_tags.iter().cloned().collect();
+        let incoming_tags: HashSet<String> =
+            incoming.semantic_tags.iter().cloned().collect();
+        if existing_tags.is_empty() && incoming_tags.is_empty() {
+            // No semantic info
+        } else {
+            let intersection = existing_tags.intersection(&incoming_tags).count();
+            let union = existing_tags.union(&incoming_tags).count();
+            let jaccard = if union > 0 {
+                intersection as f64 / union as f64
+            } else {
+                0.0
+            };
+            if jaccard < self.semantic_threshold {
+                shatter_mode = ShatterMode::MeaningBreak;
+                severity = BreakDepth::Rupture;
+            }
+        }
+
+        // Temporal drift check
+        let time_diff = incoming
+            .origin_timestamp
+            .duration_since(existing.origin_timestamp)
+            .unwrap_or(Duration::ZERO)
+            .as_secs_f64()
+            / 86400.0;
+        if time_diff > 1.0 && sim < self.temporal_threshold {
+            shatter_mode = ShatterMode::TimeRift;
+            severity = BreakDepth::Fissure;
+        }
+
+        // Multi-modal crossfire
+        if existing.modality.is_multimodal()
+            || incoming.modality.is_multimodal()
+            || existing.modality != incoming.modality
+        {
+            if sim < self.visual_threshold {
+                shatter_mode = ShatterMode::Crossfire;
+                severity = BreakDepth::Rupture;
+            }
+        }
+
+        let severity_clone = severity.clone();
+        let pair = ShatteredPair {
+            id: Uuid::new_v4(),
+            fragment_a: Arc::new(existing.clone()),
+            fragment_b: Arc::new(incoming.clone()),
+            shatter_mode,
+            severity: severity_clone,
+            detected_at: SystemTime::now(),
+            resonance_score: sim,
+            fracture_dimensions,
+            dimensional_resonances,
+            metadata: HashMap::new(),
+        };
+
+        if pair.fracture_dimensions.is_empty() && sim >= self.visual_threshold {
+            return Ok(None);
+        }
+
+        if severity == BreakDepth::Shatter {
+            return Ok(Some(pair));
+        }
+
+        let fracture_ratio = pair.fracture_dimension_ratio();
+        let weighted = pair.weighted_fracture_depth();
+        if fracture_ratio > self.contextual_threshold || weighted > 0.6 {
+            Ok(Some(pair))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+// ============================================================================
+// REDRAW POLICY — Rules of Redrawing
+// ============================================================================
+
+pub struct RedrawThresholdPolicy {
+    pub acceptance_threshold: f64,
+    pub energy_decrease_tolerance: f64,
+    pub dimensional_stability_weight: f64,
+    pub temporal_cooldown_weight: f64,
+}
+
+impl RedrawThresholdPolicy {
+    pub fn new(
+        acceptance_threshold: f64,
+        energy_decrease_tolerance: f64,
+        dimensional_stability_weight: f64,
+        temporal_cooldown_weight: f64,
+    ) -> Self {
+        Self {
+            acceptance_threshold: acceptance_threshold.clamp(0.0, 1.0),
+            energy_decrease_tolerance: energy_decrease_tolerance.clamp(0.0, 1.0),
+            dimensional_stability_weight: dimensional_stability_weight.clamp(0.0, 1.0),
+            temporal_cooldown_weight: temporal_cooldown_weight.clamp(0.0, 1.0),
+        }
+    }
+
+    fn severity_score(&self, shattered_pair: &ShatteredPair) -> f64 {
+        let dim_ratio = shattered_pair.fracture_dimension_ratio();
+        let shatter_weight = shattered_pair.weighted_fracture_depth();
+        dim_ratio * shatter_weight
+    }
+
+    fn energy_score(
+        &self,
+        current_energy: f64,
+        initial_energy: f64,
+    ) -> f64 {
+        if initial_energy < 1e-15 {
+            return 0.0;
+        }
+        let decrease_ratio = (initial_energy - current_energy) / initial_energy;
+        decrease_ratio.clamp(0.0, 1.0) * (1.0 - self.energy_decrease_tolerance)
+    }
+
+    fn dimensional_score(&self, interpolation_state: &DrawingState) -> f64 {
+        let gm = interpolation_state.gradient_magnitude();
+        let max_gm = (interpolation_state.dimensionality as f64).sqrt();
+        let normalized_gm = if max_gm > 1e-15 { gm / max_gm } else { 0.0 };
+        (1.0 - normalized_gm) * self.dimensional_stability_weight
+    }
+}
+
+impl RedrawPolicy for RedrawThresholdPolicy {
+    fn should_transcend(
+        &self,
+        shattered_pair: &ShatteredPair,
+        interpolation_state: &DrawingState,
+        current_quality: f64,
+        acceptance_threshold: f64,
+    ) -> bool {
+        let severity_score = self.severity_score(shattered_pair);
+        let initial_energy = interpolation_state.convergence_history.first().copied().unwrap_or(f64::MAX);
+        let energy_score = self.energy_score(interpolation_state.energy, initial_energy);
+        let dim_score = self.dimensional_score(interpolation_state);
+        let total_score = severity_score + energy_score + dim_score;
+        total_score >= acceptance_threshold && current_quality >= acceptance_threshold
+    }
+
+    fn compute_acceptance_threshold(
+        &self,
+        attempt_number: u32,
+        max_attempts: u32,
+    ) -> f64 {
+        let decay = (attempt_number as f64 / max_attempts.max(1) as f64).powi(2);
+        let base = self.acceptance_threshold;
+        (base * (1.0 - decay * 0.5)).clamp(0.1, base)
+    }
+}
+
+// ============================================================================
+// CANVAS EDGE — Guardian of Canvas Edges
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum EdgeMode {
+    FixedEdges,
+    FadingEdges,
+    EnergyBound,
+    Hybrid,
+}
+
+pub struct CanvasEdge {
+    pub sequence: Vec<f64>,
+    pub strategy: EdgeMode,
+    pub current_index: AtomicUsize,
+    pub base: f64,
+    pub decay: f64,
+    pub floor: f64,
+    pub attempt_count: AtomicUsize,
+}
+
+impl CanvasEdge {
+    pub fn new(
+        sequence: Vec<f64>,
+        strategy: EdgeMode,
+        base: f64,
+        decay: f64,
+        floor: f64,
+    ) -> Self {
+        let validated: Vec<f64> = sequence
+            .into_iter()
+            .filter(|&v| v >= 0.0 && v <= 1.0)
+            .collect();
+        Self {
+            sequence: if validated.is_empty() { vec![base] } else { validated },
+            strategy,
+            current_index: AtomicUsize::new(0),
+            base: base.clamp(0.0, 1.0),
+            decay: decay.clamp(0.0, 1.0),
+            floor: floor.clamp(0.0, 1.0),
+            attempt_count: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn current(&self) -> f64 {
+        match self.strategy {
+            EdgeMode::FixedEdges => {
+                let idx = self.current_index.load(Ordering::SeqCst);
+                self.sequence.get(idx).copied().unwrap_or(self.floor)
+            }
+            EdgeMode::FadingEdges => {
+                let attempts = self.attempt_count.load(Ordering::SeqCst);
+                let decayed = self.base * (1.0 - self.decay).powf(attempts as f64);
+                decayed.max(self.floor)
+            }
+            EdgeMode::EnergyBound => {
+                // Energy-guided returns base (external energy drives adjustment)
+                self.base
+            }
+            EdgeMode::Hybrid => {
+                let idx = self.current_index.load(Ordering::SeqCst);
+                let seq_val = self.sequence.get(idx).copied().unwrap_or(self.base);
+                let attempts = self.attempt_count.load(Ordering::SeqCst);
+                let decayed = seq_val * (1.0 - self.decay * 0.5).powf(attempts as f64);
+                decayed.max(self.floor)
+            }
+        }
+    }
+
+    pub fn next(&self) {
+        let _ = self.attempt_count.fetch_add(1, Ordering::SeqCst);
+        match self.strategy {
+            EdgeMode::FixedEdges | EdgeMode::Hybrid => {
+                let len = self.sequence.len();
+                if len > 0 {
+                    let current = self.current_index.load(Ordering::SeqCst);
+                    let next = (current + 1).min(len - 1);
+                    self.current_index.store(next, Ordering::SeqCst);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn reset(&self) {
+        self.current_index.store(0, Ordering::SeqCst);
+        self.attempt_count.store(0, Ordering::SeqCst);
+    }
+
+    pub fn adjust_for_energy(&self, current_energy: f64, target_energy: f64) -> f64 {
+        if target_energy < 1e-15 {
+            return self.current();
+        }
+        let ratio = current_energy / target_energy;
+        let adjusted = self.current() * ratio.sqrt();
+        adjusted.clamp(self.floor, 1.0)
+    }
+}
+
+// ============================================================================
+// ATTEMPT SCHEDULER — Calls into the Depth
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttemptTask {
+    pub atelier_id: Uuid,
+    pub scheduled_at: SystemTime,
+    pub priority: f64,
+    pub attempt_count: u32,
+}
+
+impl PartialEq for AttemptTask {
+    fn eq(&self, other: &Self) -> bool {
+        self.atelier_id == other.atelier_id
+    }
+}
+
+impl Eq for AttemptTask {}
+
+impl PartialOrd for AttemptTask {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.priority.partial_cmp(&other.priority)
+    }
+}
+
+impl Ord for AttemptTask {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.partial_cmp(other)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+pub struct AttemptScheduler {
+    pub queue: Mutex<BinaryHeap<Reverse<AttemptTask>>>,
+    pub due_list: Mutex<Vec<AttemptTask>>,
+    pub max_concurrent: usize,
+    pub active_count: AtomicUsize,
+    pub total_processed: AtomicUsize,
+}
+
+impl AttemptScheduler {
+    pub fn new() -> Self {
+        Self {
+            queue: Mutex::new(BinaryHeap::new()),
+            due_list: Mutex::new(Vec::new()),
+            max_concurrent: 8,
+            active_count: AtomicUsize::new(0),
+            total_processed: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn schedule(&self, atelier_id: Uuid, priority: f64, attempt_count: u32) {
+        let task = AttemptTask {
+            atelier_id,
+            scheduled_at: SystemTime::now(),
+            priority,
+            attempt_count,
+        };
+        self.queue.lock().push(Reverse(task));
+    }
+
+    pub fn poll_due(&self) -> Vec<AttemptTask> {
+        let mut due = self.due_list.lock();
+        if due.is_empty() {
+            let now = SystemTime::now();
+            let mut q = self.queue.lock();
+            while let Some(Reverse(task)) = q.peek() {
+                let elapsed = now.duration_since(task.scheduled_at).unwrap_or(Duration::ZERO);
+                if elapsed >= Duration::from_secs(1) {
+                    if let Some(Reverse(task)) = q.pop() {
+                        due.push(task);
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        due.clone()
+    }
+
+    pub fn acquire_slot(&self) -> bool {
+        let active = self.active_count.load(Ordering::SeqCst);
+        if active < self.max_concurrent {
+            self.active_count.fetch_add(1, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn release_slot(&self) {
+        let _ = self.active_count.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    pub fn active_tasks(&self) -> usize {
+        self.active_count.load(Ordering::SeqCst)
+    }
+
+    pub fn record_completion(&self) {
+        self.total_processed.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+// ============================================================================
+// REDRAW PIPELINE — From Fragments to Wholes
+// ============================================================================
+
+pub struct RedrawPipeline {
+    pub strategy: Box<dyn DrawingStrategy>,
+    pub perturbation: Box<dyn Disturber>,
+    pub metric: Arc<dyn HarmonyMetric>,
+    pub policy: Box<dyn RedrawPolicy>,
+    pub max_steps: usize,
+    pub form_tolerance: f64,
+    pub dormant_patience: usize,
+    pub burn_limit: f64,
+}
+
+impl RedrawPipeline {
+    pub fn new(
+        strategy: Box<dyn DrawingStrategy>,
+        perturbation: Box<dyn Disturber>,
+        metric: Arc<dyn HarmonyMetric>,
+        config: &AtelierConfig,
+    ) -> Self {
+        Self {
+            strategy,
+            perturbation,
+            metric,
+            policy: Box::new(RedrawThresholdPolicy::new(
+                config.base_boundary,
+                0.05,
+                0.95,
+                0.6,
+            )),
+            max_steps: config.offline_cycles,
+            form_tolerance: config.form_tolerance,
+            dormant_patience: config.dormant_patience,
+            burn_limit: config.burn_limit,
+        }
+    }
+
+    pub fn process_atelier(
+        &self,
+        atelier: &mut RedrawAtelier,
+        critic: &dyn Critic,
+    ) -> NullResult<RedrawnMemory> {
+        let dim = atelier.shattered_pair.fragment_a.dimensionality
+            .max(atelier.shattered_pair.fragment_b.dimensionality);
+        if dim == 0 {
+            return Err(DreamShatter::NullVector);
+        }
+
+        let mut state = DrawingState::new(dim, self.max_steps);
+        let init_alpha = 0.5f64;
+        state.current_vector = self.strategy.interpolate(
+            &atelier.shattered_pair.fragment_a.embedding,
+            &atelier.shattered_pair.fragment_b.embedding,
+            init_alpha,
+        )?;
+        state.alpha = init_alpha;
+
+        let initial_energy: f64 = state
+            .current_vector
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        state.energy = initial_energy;
+        state.best_energy = initial_energy;
+        state.best_vector = state.current_vector.clone();
+        state.previous_energy = f64::MAX;
+
+        atelier.transition_to(CanvasPhase::Blending)?;
+
+        let mut converged = false;
+        let mut exploded = false;
+
+        for step in 0..self.max_steps {
+            state.advance_step();
+            let alpha = step as f64 / self.max_steps.max(1) as f64;
+            state.alpha = alpha;
+            let interp = self.strategy.interpolate(
+                &atelier.shattered_pair.fragment_a.embedding,
+                &atelier.shattered_pair.fragment_b.embedding,
+                alpha,
+            )?;
+            state.update_vector(interp.clone());
+
+            // Check NaN/Inf
+            if state.current_vector.iter().any(|v| v.is_nan() || v.is_infinite()) {
+                return Err(DreamShatter::DrawingRuptured {
+                    step,
+                    total: self.max_steps,
+                    reason: "NaN/Inf detected in interpolated vector".into(),
+                });
+            }
+
+            // Energy divergence check
+            let energy: f64 = state.current_vector.iter().map(|v| v * v).sum::<f64>().sqrt();
+            state.energy = energy;
+            if energy > self.burn_limit {
+                atelier.transition_to(CanvasPhase::Crumpled)?;
+                exploded = true;
+                break;
+            }
+            if energy < state.best_energy {
+                state.best_energy = energy;
+                state.best_vector = state.current_vector.clone();
+                state.stagnation_counter = 0;
+            } else {
+                state.stagnation_counter += 1;
+            }
+            state.adaptive_learning_rate();
+
+            // Agitation phase
+            let perturbed = self.perturbation.perturb(&state.current_vector, step, self.max_steps)?;
+            state.disturb_count += 1;
+            state.current_vector = perturbed;
+
+            let sim_a = self
+                .metric
+                .compute(&state.current_vector, &atelier.shattered_pair.fragment_a.embedding)
+                .unwrap_or(0.0);
+            let sim_b = self
+                .metric
+                .compute(&state.current_vector, &atelier.shattered_pair.fragment_b.embedding)
+                .unwrap_or(0.0);
+            let quality = (sim_a + sim_b) / 2.0;
+            atelier.update_best_drawing(state.current_vector.clone(), quality);
+
+            // Gradient computation
+            for i in 0..dim {
+                state.gradient[i] = (state.current_vector[i] - state.best_vector[i]).abs();
+            }
+            state.apply_momentum(0.9);
+
+            if state.is_stagnating(self.dormant_patience) {
+                break;
+            }
+            if state.has_converged(self.form_tolerance) {
+                converged = true;
+                break;
+            }
+        }
+
+        let outcome = if exploded {
+            AttemptOutcome::Burnt {
+                peak_energy: state.energy,
+            }
+        } else if converged {
+            AttemptOutcome::Formed {
+                quality: atelier.best_clarity,
+            }
+        } else if state.is_stagnating(self.dormant_patience) {
+            AttemptOutcome::Stalled {
+                energy: state.energy,
+                steps: state.step,
+            }
+        } else {
+            AttemptOutcome::Scattered {
+                final_energy: state.energy,
+            }
+        };
+
+        atelier.record_attempt(
+            state.energy,
+            atelier.best_clarity,
+            state.step,
+            state.disturb_count,
+            self.policy.compute_acceptance_threshold(atelier.attempt_count, atelier.max_attempts),
+            outcome,
+            state.convergence_history.clone(),
+            SystemTime::now() - Duration::from_secs(state.step as u64 + 1),
+        );
+
+        let final_vec = match &atelier.best_drawing {
+            Some(v) => v.clone(),
+            None => {
+                atelier.transition_to(CanvasPhase::Crumpled)?;
+                return Err(DreamShatter::DreamFaded {
+                    quality: 0.0,
+                    threshold: self.policy.compute_acceptance_threshold(atelier.attempt_count, atelier.max_attempts),
+                });
+            }
+        };
+        let sim_a = self
+            .metric
+            .compute(&final_vec, &atelier.shattered_pair.fragment_a.embedding)
+            .unwrap_or(0.0);
+        let sim_b = self
+            .metric
+            .compute(&final_vec, &atelier.shattered_pair.fragment_b.embedding)
+            .unwrap_or(0.0);
+        let quality = (sim_a + sim_b) / 2.0;
+
+        let threshold = self.policy.compute_acceptance_threshold(atelier.attempt_count, atelier.max_attempts);
+        if self.policy.should_transcend(
+            &atelier.shattered_pair,
+            &state,
+            quality,
+            threshold,
+        ) && critic.accept(&final_vec, &atelier.shattered_pair.fragment_a.embedding)
+            && critic.accept(&final_vec, &atelier.shattered_pair.fragment_b.embedding)
+        {
+            atelier.transition_to(CanvasPhase::Verifying)?;
+            atelier.transition_to(CanvasPhase::Transcended)?;
+            let lineage = RedrawLineage {
+                shatter_mode: atelier.shattered_pair.shatter_mode.clone(),
+                initial_similarity: atelier.shattered_pair.resonance_score,
+                final_similarity_to_a: sim_a,
+                final_similarity_to_b: sim_b,
+                threshold_at_acceptance: threshold,
+                trajectory_energy_digest: state.convergence_history.clone(),
+                strategy_used: "ArcDraw+FluxDraw".into(),
+                agitator_used: self.perturbation.name().into(),
+            };
+            let sub = RedrawnMemory {
+                id: Uuid::new_v4(),
+                unified_embedding: final_vec,
+                source_shatter_ids: vec![atelier.shattered_pair.id],
+                source_fragment_ids: vec![atelier.shattered_pair.fragment_a.id, atelier.shattered_pair.fragment_b.id],
+                redraw_quality: quality,
+                invariant_dimensions: atelier.shattered_pair.invariant_dimensions(),
+                variant_dimensions: atelier.shattered_pair.variant_dimensions(),
+                dimensional_confidence: atelier
+                    .shattered_pair
+                    .dimensional_resonances
+                    .iter()
+                    .cloned()
+                    .collect(),
+                meta_features: {
+                    let mut m = HashMap::new();
+                    m.insert("echoes".into(), atelier.attempt_count as f64);
+                    m.insert("agitations".into(), state.disturb_count as f64);
+                    m
+                },
+                draw_alpha: state.alpha,
+                total_attempts_consumed: atelier.attempt_count,
+                total_disturbs_applied: state.disturb_count,
+                energy_at_redraw: state.energy,
+                created_at: SystemTime::now(),
+                lineage,
+            };
+            Ok(sub)
+        } else {
+            atelier.transition_to(CanvasPhase::Dormant)?;
+            atelier.enter_dormancy();
+            Err(DreamShatter::DreamFaded {
+                quality,
+                threshold,
+            })
+        }
+    }
+}
+
+// ============================================================================
+// REDRAW ENGINE — The Forge of Redrawing
+// ============================================================================
+
+pub struct RedrawEngine {
+    pub detector: Box<dyn ShatterDetector>,
+    pub pipeline: RedrawPipeline,
+    pub policy: Box<dyn RedrawPolicy>,
+    pub metric: Arc<dyn HarmonyMetric>,
+}
+
+impl RedrawEngine {
+    pub fn new(
+        pipeline: RedrawPipeline,
+        policy: Box<dyn RedrawPolicy>,
+        metric: Arc<dyn HarmonyMetric>,
+    ) -> Self {
+        Self {
+            detector: Box::new(DreamBreakDetector::new(
+                metric.clone(),
+                0.85,
+                0.5,
+            )),
+            pipeline,
+            policy,
+            metric,
+        }
+    }
+
+    pub fn create_redrawn_memory(
+        &self,
+        final_vector: &[f64],
+        shattered_pair: &ShatteredPair,
+        sim_a: f64,
+        sim_b: f64,
+        atelier: &RedrawAtelier,
+    ) -> RedrawnMemory {
+        let lineage = RedrawLineage {
+            shatter_mode: shattered_pair.shatter_mode.clone(),
+            initial_similarity: shattered_pair.resonance_score,
+            final_similarity_to_a: sim_a,
+            final_similarity_to_b: sim_b,
+            threshold_at_acceptance: atelier.best_clarity,
+            trajectory_energy_digest: Vec::new(),
+            strategy_used: "DirectRedraw".into(),
+            agitator_used: self.pipeline.perturbation.name().into(),
+        };
+        RedrawnMemory {
+            id: Uuid::new_v4(),
+            unified_embedding: final_vector.to_vec(),
+            source_shatter_ids: vec![shattered_pair.id],
+            source_fragment_ids: vec![shattered_pair.fragment_a.id, shattered_pair.fragment_b.id],
+            redraw_quality: (sim_a + sim_b) / 2.0,
+            invariant_dimensions: shattered_pair.invariant_dimensions(),
+            variant_dimensions: shattered_pair.variant_dimensions(),
+            dimensional_confidence: shattered_pair.dimensional_resonances.clone(),
+            meta_features: {
+                let mut m = HashMap::new();
+                m.insert("echoes".into(), atelier.attempt_count as f64);
+                m
+            },
+            draw_alpha: 0.5,
+            total_attempts_consumed: atelier.attempt_count,
+            total_disturbs_applied: 0,
+            energy_at_redraw: 0.0,
+            created_at: SystemTime::now(),
+            lineage,
+        }
+    }
+
+    pub fn process_atelier(
+        &self,
+        atelier: &mut RedrawAtelier,
+        critic: &dyn Critic,
+    ) -> NullResult<RedrawnMemory> {
+        self.pipeline.process_atelier(atelier, critic)
+    }
+}
+
+// ============================================================================
+// DREAM ARCHIVE — Where Fragments Rest
+// ============================================================================
+
+pub struct DreamArchive {
+    pub db: Db,
+}
+
+impl DreamArchive {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, sled::Error> {
+        let db = sled::open(path)?;
+        Ok(Self { db })
+    }
+
+    pub fn put_memory(&self, mem: &DreamFragment) -> NullResult<()> {
+        let key = format!("memory:{}", mem.id);
+        let val = bincode::serialize(mem).map_err(|e| {
+            DreamShatter::ArchiveCorrupted(format!("bincode serialize: {}", e))
+        })?;
+        self.db
+            .insert(key.as_bytes(), val)
+            .map_err(|e| DreamShatter::ArchiveCorrupted(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn get_memory(&self, id: &Uuid) -> NullResult<Option<DreamFragment>> {
+        let key = format!("memory:{}", id);
+        match self.db.get(key.as_bytes()) {
+            Ok(Some(val)) => {
+                let mem: DreamFragment = bincode::deserialize(&val).map_err(|e| {
+                    DreamShatter::ArchiveCorrupted(format!("bincode deserialize: {}", e))
+                })?;
+                Ok(Some(mem))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(DreamShatter::ArchiveCorrupted(e.to_string())),
+        }
+    }
+
+    pub fn remove(&self, key: impl AsRef<[u8]>) -> NullResult<()> {
+        self.db
+            .remove(key)
+            .map_err(|e| DreamShatter::ArchiveCorrupted(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn flush(&self) -> NullResult<()> {
+        self.db.flush().map_err(|e| DreamShatter::ArchiveCorrupted(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn archive_transcended(&self, sub: &RedrawnMemory) -> NullResult<()> {
+        let key = format!("transcended:{}", sub.id);
+        let val = bincode::serialize(sub).map_err(|e| {
+            DreamShatter::ArchiveCorrupted(format!("bincode serialize: {}", e))
+        })?;
+        self.db
+            .insert(key.as_bytes(), val)
+            .map_err(|e| DreamShatter::ArchiveCorrupted(e.to_string()))?;
+        // Auto-chronicle for transcendence operations
+        let audit = format!("audit:transcendence:{}", sub.id);
+        let audit_val = serde_json::json!({
+            "id": sub.id.to_string(),
+            "quality": sub.redraw_quality,
+            "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs_f64(),
+        });
+        let _ = self.db.insert(audit.as_bytes(), audit_val.to_string().as_bytes());
+        Ok(())
+    }
+
+    pub fn retrieve_transcended(&self, id: &Uuid) -> NullResult<Option<RedrawnMemory>> {
+        let key = format!("transcended:{}", id);
+        match self.db.get(key.as_bytes()) {
+            Ok(Some(val)) => {
+                let sub: RedrawnMemory = bincode::deserialize(&val).map_err(|e| {
+                    DreamShatter::ArchiveCorrupted(format!("bincode deserialize: {}", e))
+                })?;
+                Ok(Some(sub))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(DreamShatter::ArchiveCorrupted(e.to_string())),
+        }
+    }
+
+    pub fn get_protected_set(&self) -> HashSet<String> {
+        match self.db.get("protected_set") {
+            Ok(Some(val)) => {
+                let s: HashSet<String> = bincode::deserialize(&val).unwrap_or_default();
+                s
+            }
+            _ => HashSet::new(),
+        }
+    }
+
+    pub fn put_protected_set(&self, set: &HashSet<String>) -> NullResult<()> {
+        let val = bincode::serialize(set).map_err(|e| {
+            DreamShatter::ArchiveCorrupted(format!("bincode serialize: {}", e))
+        })?;
+        self.db
+            .insert("protected_set", val)
+            .map_err(|e| DreamShatter::ArchiveCorrupted(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn append_audit(&self, action: &str, data: serde_json::Value) -> NullResult<()> {
+        let key = format!("audit:{}", Uuid::new_v4());
+        let val = serde_json::json!({
+            "action": action,
+            "data": data,
+            "ts": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs_f64(),
+        });
+        let _ = self.db.insert(key.as_bytes(), val.to_string().as_bytes());
+        Ok(())
+    }
+
+    pub fn audit_put(&self, entry: &LogEntry) -> NullResult<()> {
+        let key = format!("audit_entry:{}", entry.id);
+        let val = bincode::serialize(entry).map_err(|e| {
+            DreamShatter::ArchiveCorrupted(format!("bincode serialize: {}", e))
+        })?;
+        self.db
+            .insert(key.as_bytes(), val)
+            .map_err(|e| DreamShatter::ArchiveCorrupted(e.to_string()))?;
+        Ok(())
+    }
+}
+
+// ============================================================================
+// GRID INDEX — The Structured Grid
+// ============================================================================
+
+use hnsw::{Hnsw, Params, Searcher};
+
+/// Cosine metric for HNSW using space::Metric trait.
+/// Distance is returned as u64 bit representation of f64 in [0, 1].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CosineMetric;
+
+impl space::Metric<Vec<f64>> for CosineMetric {
+    type Unit = u64;
+    fn distance(&self, a: &Vec<f64>, b: &Vec<f64>) -> u64 {
+        if a.is_empty() || b.is_empty() || a.len() != b.len() {
+            return 1.0f64.to_bits();
+        }
+        let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let norm_a: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let norm_b: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let denom = norm_a * norm_b;
+        if denom < 1e-15 {
+            return 1.0f64.to_bits();
+        }
+        let sim = (dot / denom).clamp(-1.0, 1.0);
+        let dist = (1.0 - sim) * 0.5; // map to [0, 1]
+        dist.to_bits()
+    }
+}
+
+/// LabeledVector wrapper for external ID tracking.
+#[derive(Clone, Debug)]
+pub struct LabeledVector {
+    pub vec: Vec<f64>,
+    pub label: usize,
+}
+
+pub type GridIndex = Hnsw<CosineMetric, Vec<f64>, StdRng, 12, 24>;
+
+fn rebuild_grid(
+    storage: &DreamArchive,
+    hnsw: &mut GridIndex,
+    id_to_label: &mut HashMap<String, usize>,
+    label_to_id: &mut HashMap<usize, String>,
+    next_label: &mut usize,
+) -> NullResult<()> {
+    let mut searcher: Searcher<u64> = Searcher::new();
+    for item in storage.db.iter() {
+        let (key, val) = item.map_err(|e| DreamShatter::ArchiveCorrupted(e.to_string()))?;
+        let k = String::from_utf8_lossy(&key);
+        if k.starts_with("memory:") {
+            let mem: DreamFragment = bincode::deserialize(&val).map_err(|e| {
+                DreamShatter::ArchiveCorrupted(format!("deserialize: {}", e))
+            })?;
+            let id_str = mem.id.to_string();
+            if id_to_label.contains_key(&id_str) {
+                continue;
+            }
+            let vec: Vec<f64> = mem.embedding.iter().cloned().collect();
+            let item_id = hnsw.insert(vec, &mut searcher);
+            id_to_label.insert(id_str.clone(), item_id);
+            label_to_id.insert(item_id, id_str);
+        }
+    }
+    *next_label = hnsw.len();
+    Ok(())
+}
+
+// ============================================================================
+// CRITICS — Judges of Truth and Illusion
+
+#[derive(Debug, Clone)]
+pub struct HarmonicCritic {
+    pub threshold: f64,
+}
+
+impl HarmonicCritic {
+    pub fn new(threshold: f64) -> Self {
+        Self {
+            threshold: threshold.clamp(0.0, 1.0),
+        }
+    }
+}
+
+impl Critic for HarmonicCritic {
+    fn score(&self, candidate_embedding: &[f64], reference_embedding: &[f64]) -> f64 {
+        if candidate_embedding.is_empty() || reference_embedding.is_empty() {
+            return 0.0;
+        }
+        if candidate_embedding.len() != reference_embedding.len() {
+            return 0.0;
+        }
+        let dot: f64 = candidate_embedding
+            .iter()
+            .zip(reference_embedding.iter())
+            .map(|(a, b)| a * b)
+            .sum();
+        let norm_a: f64 = candidate_embedding.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let norm_b: f64 = reference_embedding.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let denom = norm_a * norm_b;
+        if denom < 1e-15 {
+            return 0.0;
+        }
+        let sim = (dot / denom).clamp(-1.0, 1.0);
+        (sim + 1.0) / 2.0
+    }
+
+    fn accept(&self, candidate_embedding: &[f64], reference_embedding: &[f64]) -> bool {
+        self.score(candidate_embedding, reference_embedding) >= self.threshold
+    }
+
+    fn name(&self) -> &'static str {
+        "HarmonicCritic"
+    }
+}
+
+// ONNX conditional critic (compiled only when "onnx" feature is enabled)
+#[cfg(feature = "onnx")]
+pub struct OracleCritic {
+    pub session: Arc<Mutex<ort::Session>>,
+    pub threshold: f64,
+}
+
+#[cfg(feature = "onnx")]
+impl Critic for OracleCritic {
+    fn score(&self, candidate_embedding: &[f64], reference_embedding: &[f64]) -> f64 {
+        use ndarray::Array2;
+        let dim = candidate_embedding.len();
+        if dim == 0 || dim != reference_embedding.len() {
+            return 0.0;
+        }
+        let combined: Vec<f64> = candidate_embedding
+            .iter()
+            .chain(reference_embedding.iter())
+            .cloned()
+            .collect();
+        let input = Array2::from_shape_vec((1, dim * 2), combined).unwrap_or_else(|_| {
+            Array2::zeros((1, dim * 2))
+        });
+        // Simplified fallback: use cosine similarity
+        let dot: f64 = candidate_embedding
+            .iter()
+            .zip(reference_embedding.iter())
+            .map(|(a, b)| a * b)
+            .sum();
+        let norm_a: f64 = candidate_embedding.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let norm_b: f64 = reference_embedding.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let denom = norm_a * norm_b;
+        if denom < 1e-15 {
+            return 0.0;
+        }
+        let sim = (dot / denom).clamp(-1.0, 1.0);
+        (sim + 1.0) / 2.0
+    }
+    fn name(&self) -> &'static str {
+        "OracleCritic"
+    }
+}
+
+pub struct ChimeraCritic {
+    pub onnx: Option<Arc<dyn Critic>>,
+    pub similarity_disc: Arc<HarmonicCritic>,
+    pub onnx_weight: f64,
+    pub similarity_weight: f64,
+    pub threshold: f64,
+}
+
+impl std::fmt::Debug for ChimeraCritic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChimeraCritic")
+            .field("onnx_present", &self.onnx.is_some())
+            .field("similarity_disc", &self.similarity_disc)
+            .field("onnx_weight", &self.onnx_weight)
+            .field("similarity_weight", &self.similarity_weight)
+            .field("threshold", &self.threshold)
+            .finish()
+    }
+}
+
+impl Clone for ChimeraCritic {
+    fn clone(&self) -> Self {
+        Self {
+            onnx: self.onnx.clone(),
+            similarity_disc: self.similarity_disc.clone(),
+            onnx_weight: self.onnx_weight,
+            similarity_weight: self.similarity_weight,
+            threshold: self.threshold,
+        }
+    }
+}
+
+impl ChimeraCritic {
+    pub fn new(
+        onnx: Option<Arc<dyn Critic>>,
+        similarity_disc: Arc<HarmonicCritic>,
+        onnx_weight: f64,
+        similarity_weight: f64,
+        threshold: f64,
+    ) -> Self {
+        let total = onnx_weight + similarity_weight;
+        let (ow, sw) = if total < 1e-15 {
+            (0.5, 0.5)
+        } else {
+            (onnx_weight / total, similarity_weight / total)
+        };
+        Self {
+            onnx,
+            similarity_disc,
+            onnx_weight: ow,
+            similarity_weight: sw,
+            threshold: threshold.clamp(0.0, 1.0),
+        }
+    }
+}
+
+impl Critic for ChimeraCritic {
+    fn score(&self, candidate_embedding: &[f64], reference_embedding: &[f64]) -> f64 {
+        let sim_score = self.similarity_disc.score(candidate_embedding, reference_embedding);
+        let onnx_score = self
+            .onnx
+            .as_ref()
+            .map(|o| o.score(candidate_embedding, reference_embedding))
+            .unwrap_or(sim_score);
+        self.onnx_weight * onnx_score + self.similarity_weight * sim_score
+    }
+    fn accept(&self, candidate_embedding: &[f64], reference_embedding: &[f64]) -> bool {
+        self.score(candidate_embedding, reference_embedding) >= self.threshold
+    }
+    fn name(&self) -> &'static str {
+        "ChimeraCritic"
+    }
+}
+
+// ============================================================================
+// PROTECTIVE SEAL — Seals of Protection
+// ============================================================================
+
+#[derive(Debug, Clone, Default)]
+pub struct ProtectiveSeal {
+    pub protected: HashSet<String>,
+    pub strict_threshold: f64,
+}
+
+impl ProtectiveSeal {
+    pub fn new() -> Self {
+        Self {
+            protected: HashSet::new(),
+            strict_threshold: 0.95,
+        }
+    }
+
+    pub fn load(storage: &DreamArchive) -> Self {
+        let protected = storage.get_protected_set();
+        Self {
+            protected,
+            strict_threshold: 0.95,
+        }
+    }
+
+    pub fn protect(&mut self, id_or_cat: &str) {
+        self.protected.insert(id_or_cat.to_string());
+    }
+
+    pub fn is_protected(&self, id_or_cat: &str) -> bool {
+        self.protected.contains(id_or_cat)
+    }
+
+    pub fn any_protected(&self, source_ids: &[String]) -> bool {
+        source_ids.iter().any(|id| self.protected.contains(id))
+    }
+
+    #[allow(dead_code)]
+    pub fn any_protected_uuid(&self, source_ids: &[Uuid]) -> bool {
+        source_ids
+            .iter()
+            .any(|id| self.protected.contains(&id.to_string()))
+    }
+}
+
+// ============================================================================
+// LOGS — Tales of the Ateliers
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AtelierEvent {
+    ChamberFormed(Uuid),
+    StateShifted(Uuid, String, String),
+    EchoQueued(Uuid, SystemTime),
+    TranscendenceAchieved(Uuid, RedrawnMemory),
+    EssenceArchived(String),
+    ChronicleWritten(String),
+    ChamberDissipated(Uuid),
+    CycleCompleted { processed: usize, succeeded: usize },
+    DreamPaused(String),
+    DreamResumed(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub id: String,
+    pub timestamp: SystemTime,
+    pub state: RecordState,
+    pub note: Option<String>,
+    pub metrics_snapshot: HashMap<String, f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RecordState {
+    Blank,
+    Redrawn,
+    Incoherent,
+    Dissipated,
+    Banished,
+    Sanctioned,
+}
+
+impl LogEntry {
+    pub fn new(id: String, state: RecordState, note: Option<String>) -> Self {
+        Self {
+            id,
+            timestamp: SystemTime::now(),
+            state,
+            note,
+            metrics_snapshot: HashMap::new(),
+        }
+    }
+}
+
+// ============================================================================
+// DEPTH METRICS — Measuring the Depths
+// ============================================================================
+
+pub struct DepthMetrics {
+    pub redraw_attempts: prometheus::IntCounter,
+    pub redraw_successes: prometheus::IntCounter,
+    pub redraw_failures: prometheus::IntCounter,
+    pub active_ateliers: prometheus::IntGauge,
+    pub registry: prometheus::Registry,
+}
+
+impl DepthMetrics {
+    pub fn new() -> Self {
+        let registry = prometheus::Registry::new();
+        let redraw_attempts =
+            match prometheus::IntCounter::with_opts(prometheus::Opts::new("redraw_attempts", "Redraw attempts total")) {
+                Ok(c) => c,
+                Err(_) => return Self::default_no_register(),
+            };
+        let redraw_successes =
+            match prometheus::IntCounter::with_opts(prometheus::Opts::new("redraw_successes", "Redraw successes total")) {
+                Ok(c) => c,
+                Err(_) => return Self::default_no_register(),
+            };
+        let redraw_failures =
+            match prometheus::IntCounter::with_opts(prometheus::Opts::new("redraw_failures", "Redraw failures total")) {
+                Ok(c) => c,
+                Err(_) => return Self::default_no_register(),
+            };
+        let active_ateliers =
+            match prometheus::IntGauge::with_opts(prometheus::Opts::new("active_ateliers", "Active atelier count")) {
+                Ok(g) => g,
+                Err(_) => return Self::default_no_register(),
+            };
+        let _ = registry.register(Box::new(redraw_attempts.clone()));
+        let _ = registry.register(Box::new(redraw_successes.clone()));
+        let _ = registry.register(Box::new(redraw_failures.clone()));
+        let _ = registry.register(Box::new(active_ateliers.clone()));
+        Self {
+            redraw_attempts,
+            redraw_successes,
+            redraw_failures,
+            active_ateliers,
+            registry,
+        }
+    }
+
+    fn default_no_register() -> Self {
+        let registry = prometheus::Registry::new();
+        let redraw_attempts = prometheus::IntCounter::new("redraw_attempts", "Redraw attempts total")
+            .unwrap_or_else(|_| prometheus::IntCounter::new("fa", "fa").expect("fallback"));
+        let redraw_successes = prometheus::IntCounter::new("redraw_successes", "Redraw successes total")
+            .unwrap_or_else(|_| prometheus::IntCounter::new("fs", "fs").expect("fallback"));
+        let redraw_failures = prometheus::IntCounter::new("redraw_failures", "Redraw failures total")
+            .unwrap_or_else(|_| prometheus::IntCounter::new("ff", "ff").expect("fallback"));
+        let active_ateliers = prometheus::IntGauge::new("active_ateliers", "Active atelier count")
+            .unwrap_or_else(|_| prometheus::IntGauge::new("cq", "cq").expect("fallback"));
+        Self {
+            redraw_attempts,
+            redraw_successes,
+            redraw_failures,
+            active_ateliers,
+            registry,
+        }
+    }
+
+    pub fn gather_text(&self) -> String {
+        use prometheus::Encoder;
+        let mut buffer = Vec::new();
+        let encoder = prometheus::TextEncoder::new();
+        let mf = self.registry.gather();
+        if encoder.encode(&mf, &mut buffer).is_err() {
+            log::warn!("Depth text encoding failed");
+            return String::new();
+        }
+        match String::from_utf8(buffer) {
+            Ok(s) => s,
+            Err(_) => {
+                log::warn!("Depth output is not valid UTF-8");
+                String::new()
+            }
+        }
+    }
+}
+
+impl Default for DepthMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================================
+// THE GATEWAY — Gateway to the Shattered Dream
+// ============================================================================
+
+#[derive(Clone)]
+struct GatewayState {
+    system: Arc<SomniactaCore>,
+}
+
+fn ok_response(body: String) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .body(Full::new(Bytes::from(body)))
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))))
+}
+
+fn error_response(status: StatusCode, msg: &str) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .body(Full::new(Bytes::from(format!(r#"{{"error": "{}"}}"#, msg))))
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from(r#"{"error": "internal"}"#))))
+}
+
+fn plain_response(status: StatusCode, body: String) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .body(Full::new(Bytes::from(body)))
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from(""))))
+}
+
+fn not_found_response() -> Response<Full<Bytes>> {
+    error_response(StatusCode::NOT_FOUND, "Not Found")
+}
+
+async fn gather_body(req: Request<Incoming>) -> Result<Vec<u8>, DreamShatter> {
+    let body = req.into_body();
+    match body.collect().await {
+        Ok(collected) => Ok(collected.to_bytes().to_vec()),
+        Err(e) => Err(DreamShatter::PaperBreak(format!("body read: {}", e))),
+    }
+}
+
+async fn gateway_handler(
+    req: Request<Incoming>,
+    state: GatewayState,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    let path = req.uri().path();
+    let method = req.method().as_str();
+
+    let response = match (method, path) {
+        ("GET", "/pulse") => ok_response(
+            serde_json::json!({"status": "ok", "service": "somniacta"}).to_string(),
+        ),
+        ("GET", "/metrics") => {
+            let text = state.system.metrics.gather_text();
+            plain_response(StatusCode::OK, text)
+        }
+        ("POST", "/api/v1/blank") => {
+            let body_bytes = match gather_body(req).await {
+                Ok(b) => b,
+                Err(e) => return Ok(error_response(StatusCode::BAD_REQUEST, &e.to_string())),
+            };
+            let json: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+                Ok(j) => j,
+                Err(_) => return Ok(error_response(StatusCode::BAD_REQUEST, "invalid json")),
+            };
+            let a = match parse_memory_from_body(&json["fragment_a"]) {
+                Ok(m) => m,
+                Err(e) => return Ok(error_response(StatusCode::BAD_REQUEST, &e.to_string())),
+            };
+            let b = match parse_memory_from_body(&json["fragment_b"]) {
+                Ok(m) => m,
+                Err(e) => return Ok(error_response(StatusCode::BAD_REQUEST, &e.to_string())),
+            };
+            match state.system.submit_pair(&a, &b) {
+                Ok(Some(atelier_id)) => ok_response(
+                    serde_json::json!({"blanked": true, "atelier_id": atelier_id}).to_string(),
+                ),
+                Ok(None) => ok_response(
+                    serde_json::json!({"blanked": false, "reason": "no shatter detected"}).to_string(),
+                ),
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+        ("POST", "/api/v1/transcend") => {
+            let body_bytes = match gather_body(req).await {
+                Ok(b) => b,
+                Err(e) => return Ok(error_response(StatusCode::BAD_REQUEST, &e.to_string())),
+            };
+            let json: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+                Ok(j) => j,
+                Err(_) => return Ok(error_response(StatusCode::BAD_REQUEST, "invalid json")),
+            };
+            let atelier_id = match json["atelier_id"].as_str() {
+                Some(s) => match Uuid::parse_str(s) {
+                    Ok(u) => u,
+                    Err(_) => return Ok(error_response(StatusCode::BAD_REQUEST, "invalid atelier_id")),
+                },
+                None => return Ok(error_response(StatusCode::BAD_REQUEST, "missing atelier_id")),
+            };
+            match state.system.try_transcend(&atelier_id) {
+                Ok(sub) => ok_response(
+                    serde_json::json!({"success": true, "transcended": sub.id, "quality": sub.redraw_quality}).to_string(),
+                ),
+                Err(DreamShatter::DreamFaded { quality, threshold }) => {
+                    ok_response(
+                        serde_json::json!({"success": false, "reason": "quality insufficient", "quality": quality, "threshold": threshold}).to_string(),
+                    )
+                }
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+        ("GET", "/api/v1/ateliers") => {
+            let ids = state.system.atelier_keeper_ref().get_all_redrawable();
+            ok_response(
+                serde_json::json!({"count": ids.len(), "ateliers": ids.iter().map(|u| u.to_string()).collect::<Vec<_>>()}).to_string(),
+            )
+        }
+        ("POST", "/api/v1/dissolve") => {
+            let body_bytes = match gather_body(req).await {
+                Ok(b) => b,
+                Err(e) => return Ok(error_response(StatusCode::BAD_REQUEST, &e.to_string())),
+            };
+            let json: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+                Ok(j) => j,
+                Err(_) => return Ok(error_response(StatusCode::BAD_REQUEST, "invalid json")),
+            };
+            let atelier_id = match json["atelier_id"].as_str() {
+                Some(s) => match Uuid::parse_str(s) {
+                    Ok(u) => u,
+                    Err(_) => return Ok(error_response(StatusCode::BAD_REQUEST, "invalid atelier_id")),
+                },
+                None => return Ok(error_response(StatusCode::BAD_REQUEST, "missing atelier_id")),
+            };
+            match state.system.mark_failed(&atelier_id) {
+                Ok(()) => ok_response(serde_json::json!({"success": true}).to_string()),
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+        _ => not_found_response(),
+    };
+    Ok(response)
+}
+
+fn parse_memory_from_body(v: &serde_json::Value) -> NullResult<DreamFragment> {
+    let embedding: Vec<f64> = v["embedding"]
+        .as_array()
+        .ok_or_else(|| DreamShatter::PaletteMisaligned("missing embedding".into()))?
+        .iter()
+        .filter_map(|x| x.as_f64())
+        .collect();
+    let confidence = v["confidence"].as_f64().unwrap_or(1.0);
+    let agent_id = v["agent_id"]
+        .as_str()
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .unwrap_or_else(Uuid::new_v4);
+    Ok(DreamFragment::new(
+        embedding,
+        PerceptionLayer::Sight,
+        AmbientCanvas::default(),
+        confidence,
+        agent_id,
+    ))
+}
+
+pub async fn start_gateway_server(
+    system: Arc<SomniactaCore>,
+    addr: SocketAddr,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let state = GatewayState { system };
+    let listener = TcpListener::bind(addr).await?;
+    log::info!("Gateway listening on {}", addr);
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let io = TokioIo::new(stream);
+        let state = state.clone();
+        tokio::spawn(async move {
+            let svc = service_fn(move |req| {
+                let state = state.clone();
+                gateway_handler(req, state)
+            });
+            if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+                log::error!("gateway connection error: {}", e);
+            }
+        });
+    }
+}
+
+// ============================================================================
+// ATELIER KEEPER — Master of Ateliers
+// ============================================================================
+
+pub struct AtelierKeeper {
+    pub cells: DashMap<Uuid, RedrawAtelier>,
+    pub storage: Arc<DreamArchive>,
+    pub hnsw: Arc<RwLock<GridIndex>>,
+    pub id_to_label: Arc<RwLock<HashMap<String, usize>>>,
+    pub label_to_id: Arc<RwLock<HashMap<usize, String>>>,
+    pub next_label: Arc<AtomicUsize>,
+    pub detector: Box<dyn ShatterDetector>,
+    pub critic: Arc<dyn Critic>,
+    pub metric: Arc<dyn HarmonyMetric>,
+    pub scheduler: AttemptScheduler,
+    pub engine: Arc<RedrawEngine>,
+    pub policy: Box<dyn RedrawPolicy>,
+    pub threshold: CanvasEdge,
+    pub metrics: Arc<DepthMetrics>,
+    pub protection: Arc<Mutex<ProtectiveSeal>>,
+    pub shatter_threshold: f64,
+    pub boundary_relax_sequence: Vec<f64>,
+    pub realtime_cycles: usize,
+    pub offline_cycles: usize,
+    pub realtime_disturbs: usize,
+    pub offline_disturbs: usize,
+    pub realtime_mist: f64,
+    pub offline_mist: f64,
+    pub audit_log: Arc<Mutex<Vec<LogEntry>>>,
+    pub event_tx: mpsc::Sender<AtelierEvent>,
+    pub stop_flag: Arc<AtomicBool>,
+}
+
+impl AtelierKeeper {
+    pub fn new(
+        storage: Arc<DreamArchive>,
+        detector: Box<dyn ShatterDetector>,
+        critic: Arc<dyn Critic>,
+        metric: Arc<dyn HarmonyMetric>,
+        policy: Box<dyn RedrawPolicy>,
+        engine: Arc<RedrawEngine>,
+        threshold: CanvasEdge,
+        metrics: Arc<DepthMetrics>,
+        config: &AtelierConfig,
+        event_tx: mpsc::Sender<AtelierEvent>,
+    ) -> NullResult<Self> {
+        let params = Params::new();
+        let mut hnsw: GridIndex = Hnsw::new_params(CosineMetric, params);
+        let mut id_to_label = HashMap::new();
+        let mut label_to_id = HashMap::new();
+        let mut next_label = 0usize;
+        rebuild_grid(
+            &storage,
+            &mut hnsw,
+            &mut id_to_label,
+            &mut label_to_id,
+            &mut next_label,
+        )?;
+        let protection_seal = Arc::new(Mutex::new(ProtectiveSeal::load(&*storage)));
+        Ok(Self {
+            cells: DashMap::new(),
+            storage,
+            hnsw: Arc::new(RwLock::new(hnsw)),
+            id_to_label: Arc::new(RwLock::new(id_to_label)),
+            label_to_id: Arc::new(RwLock::new(label_to_id)),
+            next_label: Arc::new(AtomicUsize::new(next_label)),
+            detector,
+            critic,
+            metric,
+            scheduler: AttemptScheduler::new(),
+            engine,
+            policy,
+            threshold,
+            metrics,
+            protection: protection_seal,
+            shatter_threshold: config.shatter_threshold,
+            boundary_relax_sequence: config.boundary_relax.clone(),
+            realtime_cycles: config.realtime_cycles,
+            offline_cycles: config.offline_cycles,
+            realtime_disturbs: config.realtime_disturbs,
+            offline_disturbs: config.offline_disturbs,
+            realtime_mist: config.realtime_mist,
+            offline_mist: config.offline_mist,
+            audit_log: Arc::new(Mutex::new(Vec::new())),
+            event_tx,
+            stop_flag: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    pub fn index_and_archive(&self, mem: &DreamFragment) -> NullResult<()> {
+        self.storage.put_memory(mem)?;
+        let mut h = self.hnsw.write();
+        let mut id_map = self.id_to_label.write();
+        let mut label_map = self.label_to_id.write();
+        let id_str = mem.id.to_string();
+        if id_map.contains_key(&id_str) {
+            return Ok(());
+        }
+        let vec: Vec<f64> = mem.embedding.iter().cloned().collect();
+        let mut searcher: Searcher<u64> = Searcher::new();
+        let item_id = h.insert(vec, &mut searcher);
+        id_map.insert(id_str.clone(), item_id);
+        label_map.insert(item_id, id_str);
+        Ok(())
+    }
+
+    pub fn detect_shatter(&self, existing: &DreamFragment, incoming: &DreamFragment) -> bool {
+        let sim = self.metric.compute(&existing.embedding, &incoming.embedding).unwrap_or(1.0);
+        sim < self.shatter_threshold
+    }
+
+    pub fn check_seal(&self, source_ids: &[String]) -> NullResult<()> {
+        let protection = self.protection.lock();
+        if protection.any_protected(source_ids) {
+            return Err(DreamShatter::StrokeBlocked(
+                "Redraw blocked by protective seal policy".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn admit_shatter(&self, pair: ShatteredPair) -> NullResult<Uuid> {
+        let mut atelier = RedrawAtelier::new(pair, 5, Duration::from_secs(3600));
+        let atelier_id = atelier.id;
+        atelier.transition_to(CanvasPhase::Awakening)?;
+        self.cells.insert(atelier_id, atelier);
+        self.metrics.active_ateliers.inc();
+        let _ = self.event_tx.try_send(AtelierEvent::ChamberFormed(atelier_id));
+        Ok(atelier_id)
+    }
+
+    pub fn insert_shatter(&self, pair: ShatteredPair, max_attempts: u32, ttl: Duration) -> NullResult<Uuid> {
+        let mut atelier = RedrawAtelier::new(pair, max_attempts, ttl);
+        let atelier_id = atelier.id;
+        atelier.transition_to(CanvasPhase::Awakening)?;
+        self.cells.insert(atelier_id, atelier);
+        self.metrics.active_ateliers.inc();
+        let _ = self.event_tx.try_send(AtelierEvent::ChamberFormed(atelier_id));
+        Ok(atelier_id)
+    }
+
+    pub fn get_chamber(&self, id: &Uuid) -> Option<RedrawAtelier> {
+        self.cells.get(id).map(|entry| entry.value().clone())
+    }
+
+    pub fn get_chamber_mut(&self, id: &Uuid) -> Option<dashmap::mapref::one::RefMut<'_, Uuid, RedrawAtelier>> {
+        self.cells.get_mut(id)
+    }
+
+    pub fn chambers_occupied(&self) -> usize {
+        self.cells.len()
+    }
+
+    pub fn get_all_redrawable(&self) -> Vec<Uuid> {
+        self.cells
+            .iter()
+            .filter(|entry| entry.value().is_redrawable())
+            .map(|entry| *entry.key())
+            .collect()
+    }
+
+    pub fn dissipate_overdue_chambers(&self) {
+        let to_remove: Vec<Uuid> = self
+            .cells
+            .iter()
+            .filter(|entry| entry.value().is_expired())
+            .map(|entry| *entry.key())
+            .collect();
+        for id in &to_remove {
+            if let Some((_, atelier)) = self.cells.remove(id) {
+                self.metrics.active_ateliers.dec();
+                let _ = self.event_tx.try_send(AtelierEvent::ChamberDissipated(atelier.id));
+                let entry = LogEntry::new(
+                    id.to_string(),
+                    RecordState::Dissipated,
+                    Some("auto-expired by scheduler".to_string()),
+                );
+                self.audit_log.lock().push(entry.clone());
+                let _ = self.storage.audit_put(&entry);
+            }
+        }
+    }
+
+    pub fn next_ready_chamber(&self) -> Option<Uuid> {
+        let retryable: Vec<Uuid> = self.get_all_redrawable();
+        retryable.into_iter().next()
+    }
+
+    pub fn release_scheduler_slot(&self) {
+        self.scheduler.release_slot();
+    }
+
+    #[allow(dead_code)]
+    pub fn attempt_transcend_realtime(
+        &self,
+        a: &DreamFragment,
+        b: &DreamFragment,
+    ) -> NullResult<RedrawnMemory> {
+        self.metrics.redraw_attempts.inc();
+        if let Err(e) = self.check_seal(&[a.id.to_string(), b.id.to_string()]) {
+            self.metrics.redraw_failures.inc();
+            return Err(e);
+        }
+        let dim = a.dimensionality.max(b.dimensionality);
+        let mut state = DrawingState::new(dim, self.realtime_cycles);
+        state.current_vector = self.engine.pipeline.strategy.interpolate(
+            &a.embedding,
+            &b.embedding,
+            0.5,
+        )?;
+        let mut best_vector = state.current_vector.clone();
+        let mut best_score = 0.0f64;
+        for step in 0..self.realtime_cycles {
+            let alpha = step as f64 / self.realtime_cycles.max(1) as f64;
+            state.alpha = alpha;
+            state.current_vector = self.engine.pipeline.strategy.interpolate(
+                &a.embedding,
+                &b.embedding,
+                alpha,
+            )?;
+            let mut local_best = state.current_vector.clone();
+            let mut local_best_score = 0.0f64;
+            for _ in 0..self.realtime_disturbs {
+                let mut perturbed = state.current_vector.clone();
+                let sigma = self.realtime_mist;
+                let mut rng = rand::thread_rng();
+                for i in 0..perturbed.len() {
+                    perturbed[i] += draw_from_chaos(&mut rng) * sigma;
+                }
+                let sa = self.critic.score(&perturbed, &a.embedding);
+                let sb = self.critic.score(&perturbed, &b.embedding);
+                let score = (sa + sb) / 2.0;
+                if score > local_best_score {
+                    local_best_score = score;
+                    local_best = perturbed;
+                }
+            }
+            let sa = self.critic.score(&local_best, &a.embedding);
+            let sb = self.critic.score(&local_best, &b.embedding);
+            let score = (sa + sb) / 2.0;
+            if score > best_score {
+                best_score = score;
+                best_vector = local_best;
+            }
+        }
+        for &threshold in &self.boundary_relax_sequence {
+            if best_score >= threshold {
+                if self.critic.accept(&best_vector, &a.embedding)
+                    && self.critic.accept(&best_vector, &b.embedding)
+                {
+                    let pair = ShatteredPair::new(
+                        Arc::new(a.clone()),
+                        Arc::new(b.clone()),
+                        ShatterMode::GridDistortion,
+                        best_score,
+                        Vec::new(),
+                        Vec::new(),
+                    );
+                    let atelier = RedrawAtelier::new(pair.clone(), 3, Duration::from_secs(3600));
+                    let sub_mem = self.engine.create_redrawn_memory(
+                        &best_vector,
+                        &pair,
+                        best_score,
+                        best_score,
+                        &atelier,
+                    );
+                    self.storage.archive_transcended(&sub_mem)?;
+                    self.metrics.redraw_successes.inc();
+                    let entry = LogEntry::new(
+                        sub_mem.id.to_string(),
+                        RecordState::Redrawn,
+                        Some(format!("realtime redrawn at threshold {}", threshold)),
+                    );
+                    self.audit_log.lock().push(entry.clone());
+                    let _ = self.storage.audit_put(&entry);
+                    let _ = self.event_tx.try_send(AtelierEvent::EssenceArchived(sub_mem.id.to_string()));
+                    return Ok(sub_mem);
+                }
+            }
+        }
+        self.metrics.redraw_failures.inc();
+        let entry = LogEntry::new(
+            format!("{}+{}", a.id, b.id),
+            RecordState::Incoherent,
+            Some("realtime unfusable".to_string()),
+        );
+        self.audit_log.lock().push(entry.clone());
+        let _ = self.storage.audit_put(&entry);
+        Err(DreamShatter::DreamFaded {
+            quality: best_score,
+            threshold: *self.boundary_relax_sequence.last().unwrap_or(&0.8),
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn attempt_transcend_offline(
+        &self,
+        a: &DreamFragment,
+        b: &DreamFragment,
+    ) -> NullResult<RedrawnMemory> {
+        self.metrics.redraw_attempts.inc();
+        if let Err(e) = self.check_seal(&[a.id.to_string(), b.id.to_string()]) {
+            self.metrics.redraw_failures.inc();
+            return Err(e);
+        }
+        let dim = a.dimensionality.max(b.dimensionality);
+        let mut state = DrawingState::new(dim, self.offline_cycles);
+        state.current_vector = self.engine.pipeline.strategy.interpolate(
+            &a.embedding,
+            &b.embedding,
+            0.5,
+        )?;
+        let mut best_vector = state.current_vector.clone();
+        let mut best_score = 0.0f64;
+        for step in 0..self.offline_cycles {
+            let alpha = step as f64 / self.offline_cycles.max(1) as f64;
+            state.alpha = alpha;
+            state.current_vector = self.engine.pipeline.strategy.interpolate(
+                &a.embedding,
+                &b.embedding,
+                alpha,
+            )?;
+            let mut local_best = state.current_vector.clone();
+            let mut local_best_score = 0.0f64;
+            for _ in 0..self.offline_disturbs {
+                let mut perturbed = state.current_vector.clone();
+                let sigma = self.offline_mist;
+                let mut rng = rand::thread_rng();
+                for i in 0..perturbed.len() {
+                    perturbed[i] += draw_from_chaos(&mut rng) * sigma;
+                }
+                let sa = self.critic.score(&perturbed, &a.embedding);
+                let sb = self.critic.score(&perturbed, &b.embedding);
+                let score = (sa + sb) / 2.0;
+                if score > local_best_score {
+                    local_best_score = score;
+                    local_best = perturbed;
+                }
+            }
+            let sa = self.critic.score(&local_best, &a.embedding);
+            let sb = self.critic.score(&local_best, &b.embedding);
+            let score = (sa + sb) / 2.0;
+            if score > best_score {
+                best_score = score;
+                best_vector = local_best;
+            }
+        }
+        for &threshold in &self.boundary_relax_sequence {
+            if best_score >= threshold {
+                if self.critic.accept(&best_vector, &a.embedding)
+                    && self.critic.accept(&best_vector, &b.embedding)
+                {
+                    let pair = ShatteredPair::new(
+                        Arc::new(a.clone()),
+                        Arc::new(b.clone()),
+                        ShatterMode::GridDistortion,
+                        best_score,
+                        Vec::new(),
+                        Vec::new(),
+                    );
+                    let atelier = RedrawAtelier::new(pair.clone(), 10, Duration::from_secs(3600));
+                    let sub_mem = self.engine.create_redrawn_memory(
+                        &best_vector,
+                        &pair,
+                        best_score,
+                        best_score,
+                        &atelier,
+                    );
+                    self.storage.archive_transcended(&sub_mem)?;
+                    self.metrics.redraw_successes.inc();
+                    let entry = LogEntry::new(
+                        sub_mem.id.to_string(),
+                        RecordState::Redrawn,
+                        Some(format!("offline redrawn at threshold {}", threshold)),
+                    );
+                    self.audit_log.lock().push(entry.clone());
+                    let _ = self.storage.audit_put(&entry);
+                    return Ok(sub_mem);
+                }
+            }
+        }
+        self.metrics.redraw_failures.inc();
+        let entry = LogEntry::new(
+            format!("{}+{}", a.id, b.id),
+            RecordState::Incoherent,
+            Some("offline unfusable".to_string()),
+        );
+        self.audit_log.lock().push(entry.clone());
+        let _ = self.storage.audit_put(&entry);
+        Err(DreamShatter::DreamFaded {
+            quality: best_score,
+            threshold: *self.boundary_relax_sequence.last().unwrap_or(&0.8),
+        })
+    }
+
+    pub fn rollback_transcendence(&self, transcendence_id: &str) -> NullResult<()> {
+        let key = format!("transcended:{}", transcendence_id);
+        self.storage.remove(key.as_bytes())?;
+        let _ = self.storage.append_audit("rollback", serde_json::json!({"transcendence_id": transcendence_id}));
+        Ok(())
+    }
+
+    pub fn process_next_due(&self) -> NullResult<()> {
+        let due_attempts = self.scheduler.poll_due();
+        for attempt in due_attempts {
+            if let Some(mut atelier_ref) = self.cells.get_mut(&attempt.atelier_id) {
+                let atelier = &mut *atelier_ref;
+                if atelier.is_redrawable() {
+                    match self.engine.process_atelier(atelier, self.critic.as_ref()) {
+                        Ok(sub_mem) => {
+                            let _ = self.event_tx.try_send(AtelierEvent::TranscendenceAchieved(
+                                attempt.atelier_id,
+                                sub_mem,
+                            ));
+                        }
+                        Err(e) => {
+                            log::warn!("Chamber {} processing failed: {:?}", attempt.atelier_id, e);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// SOMNIACTA CORE — Heart of the System
+// ============================================================================
+
+pub struct SomniactaCore {
+    pub atelier_keeper: Arc<AtelierKeeper>,
+    pub engine: Arc<RedrawEngine>,
+    pub detector: Arc<dyn ShatterDetector>,
+    pub policy: Arc<dyn RedrawPolicy>,
+    pub metric: Arc<dyn HarmonyMetric>,
+    pub pipeline: Arc<RedrawPipeline>,
+    pub perturbation: Arc<dyn Disturber>,
+    pub storage: Arc<DreamArchive>,
+    pub hnsw_index: Arc<RwLock<GridIndex>>,
+    pub id_to_label: Arc<RwLock<HashMap<String, usize>>>,
+    pub label_to_id: Arc<RwLock<HashMap<usize, String>>>,
+    pub next_label: Arc<AtomicUsize>,
+    pub protection: Arc<Mutex<ProtectiveSeal>>,
+    pub critic: Arc<dyn Critic>,
+    pub metrics: Arc<DepthMetrics>,
+    pub config: AtelierConfig,
+    stop_flag: AtomicBool,
+}
+
+impl SomniactaCore {
+    pub fn new<P: AsRef<Path>>(
+        db_path: P,
+        detector: Arc<dyn ShatterDetector>,
+        policy: Arc<dyn RedrawPolicy>,
+        metric: Arc<dyn HarmonyMetric>,
+        _strategy: Arc<dyn DrawingStrategy>,
+        perturbation: Arc<dyn Disturber>,
+        critic: Arc<dyn Critic>,
+        config: AtelierConfig,
+    ) -> NullResult<Self> {
+        let storage = Arc::new(DreamArchive::open(db_path).map_err(|e| DreamShatter::ArchiveCorrupted(e.to_string()))?);
+        let hnsw = GridIndex::new_params(CosineMetric, Params::new());
+        let pipeline = Arc::new(RedrawPipeline::new(
+            Box::new(ArcDraw::new()),
+            Box::new(MistDisturber::new(0.02, 2.0)),
+            Arc::clone(&metric),
+            &config,
+        ));
+        let engine = Arc::new(RedrawEngine::new(
+            RedrawPipeline::new(
+                Box::new(ArcDraw::new()),
+                Box::new(MistDisturber::new(0.02, 2.0)),
+                Arc::clone(&metric),
+                &config,
+            ),
+            Box::new(RedrawThresholdPolicy::new(
+                config.base_boundary,
+                0.05,
+                0.95,
+                0.6,
+            )),
+            Arc::clone(&metric),
+        ));
+        let (event_tx, event_rx) = mpsc::channel::<AtelierEvent>(8192);
+        let atelier_keeper = Arc::new(AtelierKeeper::new(
+            storage.clone(),
+            Box::new(DreamBreakDetector::new(metric.clone(), config.shatter_threshold, 0.5)),
+            critic.clone(),
+            metric.clone(),
+            Box::new(RedrawThresholdPolicy::new(config.base_boundary, 0.05, 0.95, 0.6)),
+            Arc::clone(&engine),
+            CanvasEdge::new(
+                config.boundary_relax.clone(),
+                EdgeMode::Hybrid,
+                config.base_boundary,
+                0.1,
+                0.6,
+            ),
+            Arc::new(DepthMetrics::new()),
+            &config,
+            event_tx,
+        )?);
+        // Spawn background event consumer to prevent channel backlog
+        tokio::spawn(async move {
+            let mut rx = event_rx;
+            while let Some(event) = rx.recv().await {
+                match event {
+                    AtelierEvent::ChamberFormed(id) => {
+                        log::debug!("Atelier formed: {}", id);
+                    }
+                    AtelierEvent::TranscendenceAchieved(id, _) => {
+                        log::info!("Redraw achieved for atelier: {}", id);
+                    }
+                    AtelierEvent::ChamberDissipated(id) => {
+                        log::debug!("Atelier dissipated: {}", id);
+                    }
+                    AtelierEvent::EssenceArchived(id) => {
+                        log::debug!("Essence archived: {}", id);
+                    }
+                    AtelierEvent::CycleCompleted { processed, succeeded } => {
+                        log::info!("Cycle completed: {}/{} ascensions", succeeded, processed);
+                    }
+                    _ => {
+                        log::trace!("Atelier event: {:?}", event);
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            atelier_keeper,
+            engine,
+            detector,
+            policy,
+            metric,
+            pipeline,
+            perturbation,
+            storage,
+            hnsw_index: Arc::new(RwLock::new(hnsw)),
+            id_to_label: Arc::new(RwLock::new(HashMap::new())),
+            label_to_id: Arc::new(RwLock::new(HashMap::new())),
+            next_label: Arc::new(AtomicUsize::new(0)),
+            protection: Arc::new(Mutex::new(ProtectiveSeal::new())),
+            critic,
+            metrics: Arc::new(DepthMetrics::new()),
+            config,
+            stop_flag: AtomicBool::new(false),
+        })
+    }
+
+    pub fn detect_and_blank(
+        &self,
+        a: &DreamFragment,
+        b: &DreamFragment,
+    ) -> NullResult<Option<Uuid>> {
+        self.metrics.redraw_attempts.inc();
+        match self.detector.detect(a, b)? {
+            Some(shattered_pair) => {
+                let id = self.atelier_keeper.admit_shatter(shattered_pair)?;
+                self.metrics
+                    .active_ateliers
+                    .set(self.atelier_keeper.chambers_occupied() as i64);
+                Ok(Some(id))
+            }
+            None => {
+                self.metrics.redraw_successes.inc();
+                Ok(None)
+            }
+        }
+    }
+
+    pub fn try_transcend(&self, atelier_id: &Uuid) -> NullResult<RedrawnMemory> {
+        self.metrics.redraw_attempts.inc();
+        let mut atelier = self
+            .atelier_keeper
+            .get_chamber_mut(atelier_id)
+            .ok_or(DreamShatter::AtelierLost(*atelier_id))?;
+        let result = self.engine.process_atelier(&mut atelier, self.critic.as_ref());
+        match &result {
+            Ok(_) => self.metrics.redraw_successes.inc(),
+            Err(_) => self.metrics.redraw_failures.inc(),
+        }
+        self.metrics
+            .active_ateliers
+            .set(self.atelier_keeper.chambers_occupied() as i64);
+        result
+    }
+
+    pub fn process_next_ready(&self) -> Option<NullResult<RedrawnMemory>> {
+        let atelier_id = self.atelier_keeper.next_ready_chamber()?;
+        let result = self.try_transcend(&atelier_id);
+        self.atelier_keeper.release_scheduler_slot();
+        Some(result)
+    }
+
+    pub fn expire_cells(&self) {
+        self.atelier_keeper.dissipate_overdue_chambers();
+    }
+
+    pub fn submit_pair(&self, a: &DreamFragment, b: &DreamFragment) -> NullResult<Option<Uuid>> {
+        self.detect_and_blank(a, b)
+    }
+
+    pub fn mark_failed(&self, atelier_id: &Uuid) -> NullResult<()> {
+        let atelier = self
+            .atelier_keeper
+            .get_chamber(atelier_id)
+            .ok_or(DreamShatter::AtelierLost(*atelier_id))?;
+        if atelier.state != CanvasPhase::Crumpled {
+            drop(atelier);
+            let mut atelier = self
+                .atelier_keeper
+                .get_chamber_mut(atelier_id)
+                .ok_or(DreamShatter::AtelierLost(*atelier_id))?;
+            atelier.transition_to(CanvasPhase::Crumpled).ok();
+        }
+        Ok(())
+    }
+
+    pub fn shutdown(&self) {
+        self.stop_flag.store(true, Ordering::Relaxed);
+        if let Err(e) = self.storage.flush() {
+            log::warn!("archive sync failed on dissolution: {:?}", e);
+        }
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stop_flag.load(Ordering::Relaxed)
+    }
+
+    pub fn atelier_keeper_ref(&self) -> &AtelierKeeper {
+        &self.atelier_keeper
+    }
+}
+
+// ============================================================================
+// ATELIER CONFIG — Parameters of Configuration
+// ============================================================================
+
+pub struct AtelierConfig {
+    pub max_ateliers: usize,
+    pub default_lifespan: Duration,
+    pub max_attempts: u32,
+    pub base_boundary: f64,
+    pub form_tolerance: f64,
+    pub dormant_patience: usize,
+    pub burn_limit: f64,
+    pub shatter_threshold: f64,
+    pub boundary_relax: Vec<f64>,
+    pub realtime_cycles: usize,
+    pub offline_cycles: usize,
+    pub realtime_disturbs: usize,
+    pub offline_disturbs: usize,
+    pub realtime_mist: f64,
+    pub offline_mist: f64,
+    pub archive_path: String,
+    pub metrics_addr: String,
+    pub fragment_dimensions: usize,
+    pub gateway_addr: String,
+}
+
+impl Default for AtelierConfig {
+    fn default() -> Self {
+        Self {
+            max_ateliers: 10000,
+            default_lifespan: Duration::from_secs(86400),
+            max_attempts: 5,
+            base_boundary: 0.75,
+            form_tolerance: 1e-6,
+            dormant_patience: 10,
+            burn_limit: 1e6,
+            shatter_threshold: 0.75,
+            boundary_relax: vec![0.95, 0.90, 0.85, 0.80],
+            realtime_cycles: 8,
+            offline_cycles: 40,
+            realtime_disturbs: 3,
+            offline_disturbs: 20,
+            realtime_mist: 0.02,
+            offline_mist: 0.05,
+            archive_path: "somniacta_db".to_string(),
+            metrics_addr: "127.0.0.1:9898".to_string(),
+            fragment_dimensions: 128,
+            gateway_addr: "0.0.0.0:8080".to_string(),
+        }
+    }
+}
+
+impl AtelierConfig {
+    pub fn validate(&self) -> NullResult<()> {
+        if self.max_ateliers == 0 {
+            return Err(DreamShatter::PaletteMisaligned("max_ateliers must be > 0".to_string()));
+        }
+        if self.fragment_dimensions == 0 {
+            return Err(DreamShatter::PaletteMisaligned("fragment_dimensions must be > 0".to_string()));
+        }
+        if self.base_boundary < 0.0 || self.base_boundary > 1.0 {
+            return Err(DreamShatter::CanvasEdgeVoid {
+                value: self.base_boundary,
+                min: 0.0,
+                max: 1.0,
+            });
+        }
+        if self.boundary_relax.is_empty() {
+            return Err(DreamShatter::PaletteMisaligned("boundary_relax must not be empty".to_string()));
+        }
+        for &v in &self.boundary_relax {
+            if v < 0.0 || v > 1.0 {
+                return Err(DreamShatter::CanvasEdgeVoid {
+                    value: v,
+                    min: 0.0,
+                    max: 1.0,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Clone for AtelierConfig {
+    fn clone(&self) -> Self {
+        Self {
+            max_ateliers: self.max_ateliers,
+            default_lifespan: self.default_lifespan,
+            max_attempts: self.max_attempts,
+            base_boundary: self.base_boundary,
+            form_tolerance: self.form_tolerance,
+            dormant_patience: self.dormant_patience,
+            burn_limit: self.burn_limit,
+            shatter_threshold: self.shatter_threshold,
+            boundary_relax: self.boundary_relax.clone(),
+            realtime_cycles: self.realtime_cycles,
+            offline_cycles: self.offline_cycles,
+            realtime_disturbs: self.realtime_disturbs,
+            offline_disturbs: self.offline_disturbs,
+            realtime_mist: self.realtime_mist,
+            offline_mist: self.offline_mist,
+            archive_path: self.archive_path.clone(),
+            metrics_addr: self.metrics_addr.clone(),
+            fragment_dimensions: self.fragment_dimensions,
+            gateway_addr: self.gateway_addr.clone(),
+        }
+    }
+}
+
+// ============================================================================
+// ILLUSION SPAWN — Creating Illusions
+// ============================================================================
+
+pub fn spawn_illusions(
+    base_vec: &[f64],
+    rng: &mut impl Rng,
+) -> Vec<(Vec<f64>, Vec<f64>, bool)> {
+    let mut pairs = Vec::new();
+    for _ in 0..50 {
+        let lighting = rng.gen_range(100.0..1000.0);
+        let scale = 1.0 + (lighting - 500.0) / 5000.0;
+        let mut v: Vec<f64> = base_vec.iter().map(|x| x * scale).collect();
+        SenseDisturber::soften(&mut v, 5);
+        // Apply blank
+        let dim = v.len();
+        if dim > 0 {
+            let block_size = dim / 8;
+            let block_start = rng.gen_range(0..dim.saturating_sub(block_size).max(1));
+            for i in block_start..(block_start + block_size).min(dim) {
+                v[i] *= rng.gen_range(0.5..0.9);
+            }
+        }
+        // Apply parallax
+        let shift = rng.gen_range(-0.05..0.05);
+        if dim > 0 {
+            let offset = (shift * dim as f64).round() as isize;
+            let mut result = vec![0.0; dim];
+            for i in 0..dim {
+                let src = i as isize - offset;
+                if src >= 0 && (src as usize) < dim {
+                    result[i] = v[src as usize];
+                }
+            }
+            v = result;
+        }
+        pairs.push((base_vec.to_vec(), v, true));
+    }
+    for _ in 0..50 {
+        let lighting = rng.gen_range(100.0..1000.0);
+        let scale = 1.0 + (lighting - 500.0) / 5000.0;
+        let mut v: Vec<f64> = base_vec.iter().map(|x| x * scale).collect();
+        SenseDisturber::soften(&mut v, 5);
+        let dim = v.len();
+        if dim > 0 {
+            let block_size = dim / 8;
+            let block_start = rng.gen_range(0..dim.saturating_sub(block_size).max(1));
+            for i in block_start..(block_start + block_size).min(dim) {
+                v[i] *= rng.gen_range(0.5..0.9);
+            }
+            let shift = rng.gen_range(-0.05..0.05);
+            let offset = (shift * dim as f64).round() as isize;
+            let mut result = vec![0.0; dim];
+            for i in 0..dim {
+                let src = i as isize - offset;
+                if src >= 0 && (src as usize) < dim {
+                    result[i] = v[src as usize];
+                }
+            }
+            v = result;
+        }
+        let same = rng.gen_bool(0.5);
+        if same {
+            pairs.push((base_vec.to_vec(), v, true));
+        } else {
+            let mut other = v.clone();
+            for val in &mut other {
+                *val += rng.gen_range(-0.3..0.3);
+            }
+            pairs.push((v, other, false));
+        }
+    }
+    pairs
+}
+
+// ============================================================================
+// DEPTH BENCHMARK — Trials in the Depth
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct ThresholdMetrics {
+    pub threshold: f64,
+    pub precision: f64,
+    pub recall: f64,
+    pub f1: f64,
+    pub accuracy: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct OracleJudgment {
+    pub critic_name: String,
+    pub total_samples: usize,
+    pub positive_samples: usize,
+    pub auc: f64,
+    pub best_threshold: f64,
+    pub best_f1: f64,
+    pub threshold_metrics: Vec<ThresholdMetrics>,
+    pub avg_score_same: f64,
+    pub avg_score_diff: f64,
+}
+
+pub fn depth_benchmark<D: Critic>(
+    pairs: &[(Vec<f64>, Vec<f64>, bool)],
+    metric: &dyn HarmonyMetric,
+    critic: &D,
+    threshold_seq: &[f64],
+) -> NullResult<OracleJudgment> {
+    let mut scores_same = Vec::new();
+    let mut scores_diff = Vec::new();
+    for (a, b, should_same) in pairs {
+        let sim_score = metric.compute(a, b).unwrap_or(0.0);
+        let disc_score = critic.score(a, b);
+        let final_score = (sim_score * 0.5 + disc_score * 0.5).clamp(0.0, 1.0);
+        if *should_same {
+            scores_same.push(final_score);
+        } else {
+            scores_diff.push(final_score);
+        }
+    }
+    let pos_samples = scores_same.len();
+    let neg_samples = scores_diff.len();
+    let total = pairs.len();
+    let avg_same = if pos_samples > 0 {
+        scores_same.iter().sum::<f64>() / pos_samples as f64
+    } else {
+        0.0
+    };
+    let avg_diff = if neg_samples > 0 {
+        scores_diff.iter().sum::<f64>() / neg_samples as f64
+    } else {
+        0.0
+    };
+    // Compute AUC
+    let mut tp_count = 0u64;
+    let mut pairs_count = 0u64;
+    for &score in &scores_same {
+        tp_count += scores_diff.iter().filter(|&&d| d < score).count() as u64;
+        pairs_count += neg_samples as u64;
+    }
+    let auc = if pairs_count > 0 {
+        tp_count as f64 / pairs_count as f64
+    } else {
+        0.5
+    };
+    // Per-threshold metrics
+    let mut best_f1 = 0.0;
+    let mut best_threshold = 0.0;
+    let mut metrics = Vec::new();
+    for &thresh in threshold_seq {
+        let tp = scores_same.iter().filter(|&&s| s >= thresh).count() as f64;
+        let fp = scores_diff.iter().filter(|&&s| s >= thresh).count() as f64;
+        let fn_ = scores_same.iter().filter(|&&s| s < thresh).count() as f64;
+        let tn = scores_diff.iter().filter(|&&s| s < thresh).count() as f64;
+        let precision = if tp + fp > 0.0 { tp / (tp + fp) } else { 0.0 };
+        let recall = if tp + fn_ > 0.0 { tp / (tp + fn_) } else { 0.0 };
+        let f1 = if precision + recall > 0.0 {
+            2.0 * precision * recall / (precision + recall)
+        } else {
+            0.0
+        };
+        let accuracy = (tp + tn) / total.max(1) as f64;
+        if f1 > best_f1 {
+            best_f1 = f1;
+            best_threshold = thresh;
+        }
+        metrics.push(ThresholdMetrics {
+            threshold: thresh,
+            precision,
+            recall,
+            f1,
+            accuracy,
+        });
+    }
+    // Write CSV
+    let mut wtr = Writer::from_path("depth_results.csv")
+        .map_err(|e| DreamShatter::ArchiveCorrupted(e.to_string()))?;
+    let _ = wtr.write_record(&["threshold", "precision", "recall", "f1", "accuracy"]);
+    for m in &metrics {
+        let _ = wtr.write_record(&[
+            format!("{:.4}", m.threshold),
+            format!("{:.4}", m.precision),
+            format!("{:.4}", m.recall),
+            format!("{:.4}", m.f1),
+            format!("{:.4}", m.accuracy),
+        ]);
+    }
+    let _ = wtr.flush();
+    Ok(OracleJudgment {
+        critic_name: critic.name().to_string(),
+        total_samples: total,
+        positive_samples: pos_samples,
+        auc,
+        best_threshold,
+        best_f1,
+        threshold_metrics: metrics,
+        avg_score_same: avg_same,
+        avg_score_diff: avg_diff,
+    })
+}
+
+// ============================================================================
+// K8S MANIFESTS — Manifests of Deployment
+// ============================================================================
+
+pub const K8S_MANIFEST_YAML: &str = r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: somniacta
+  labels:
+    app: somniacta
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: somniacta
+  template:
+    metadata:
+      labels:
+        app: somniacta
+    spec:
+      containers:
+        - name: somniacta
+          image: your-registry/somniacta:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 9898
+              name: metrics
+          env:
+            - name: RUST_LOG
+              value: info
+          resources:
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+            requests:
+              cpu: "1000m"
+              memory: "2Gi"
+          volumeMounts:
+            - name: archive-data
+              mountPath: /app/data
+      volumes:
+        - name: archive-data
+          persistentVolumeClaim:
+            claimName: dream-archive-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: somniacta-svc
+spec:
+  selector:
+    app: somniacta
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
+      name: http
+    - protocol: TCP
+      port: 9898
+      targetPort: 9898
+      name: metrics
+  type: ClusterIP
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: somniacta-metrics
+  labels:
+    app: somniacta
+spec:
+  selector:
+    matchLabels:
+      app: somniacta
+  endpoints:
+    - port: metrics
+      interval: 30s
+      path: /metrics
+---
+# Prometheus scrape config snippet
+# - job_name: 'somniacta'
+#   static_configs:
+#     - targets: ['somniacta-svc:9898']
+"#;
+
+pub fn export_k8s_manifests(path: &str) -> std::io::Result<()> {
+    let mut f = File::create(path)?;
+    f.write_all(K8S_MANIFEST_YAML.as_bytes())?;
+    println!("K8s manifests written to {}", path);
+    Ok(())
+}
+
+// ============================================================================
+// AWAKENING — The Shatter Begins
+// ============================================================================
+
+#[tokio::main]
+async fn main() -> AnyhowResult<()> {
+    // 环境变量自由选择日志后端
+    // SOMNIACTA_LOG=tracing   -> 使用 tracing-subscriber
+    // SOMNIACTA_LOG=env_logger 或 unset -> 使用 env_logger
+    // 两者都用 try_init()，互不抢占，绝不 panic
+    match std::env::var("SOMNIACTA_LOG").as_deref() {
+        Ok("tracing") => {
+            if tracing_subscriber::fmt().try_init().is_err() {
+                let _ = env_logger::try_init();
+            }
+        }
+        _ => {
+            if env_logger::try_init().is_err() {
+                let _ = tracing_subscriber::fmt().try_init();
+            }
+        }
+    }
+
+    println!("============================================================");
+    println!("  梦与非梦皆尽碎系统 (Somniacta System) 碎裂中...");
+    println!("  梦与非梦尽碎 — 碎裂检测与重绘系统 v1.0.0");
+    println!("============================================================");
+
+    let config = AtelierConfig::default();
+    let metric: Arc<dyn HarmonyMetric> = Arc::new(HarmonicEcho);
+    let detector: Arc<dyn ShatterDetector> = Arc::new(DreamBreakDetector::new(
+        Arc::clone(&metric),
+        0.85,
+        0.5,
+    ));
+    let policy: Arc<dyn RedrawPolicy> = Arc::new(RedrawThresholdPolicy::new(0.85, 0.05, 0.95, 0.6));
+    let strategy: Arc<dyn DrawingStrategy> = Arc::new(ArcDraw::new());
+    let perturbation: Arc<dyn Disturber> = Arc::new(MistDisturber::new(0.05, 2.0));
+
+    let harmonic_arbiter = Arc::new(HarmonicCritic::new(0.75));
+    let critic: Arc<dyn Critic> = Arc::new(ChimeraCritic::new(
+        None,
+        harmonic_arbiter,
+        1.0,
+        0.0,
+        0.75,
+    ));
+
+    let system = Arc::new(SomniactaCore::new(
+        &config.archive_path,
+        detector,
+        policy,
+        Arc::clone(&metric),
+        strategy,
+        perturbation,
+        critic.clone(),
+        config.clone(),
+    ).map_err(|e| anyhow::anyhow!(e.to_string()))?);
+
+    // Protective seal
+    {
+        let mut prot = system.protection.lock();
+        prot.protect("sensitive:face");
+        prot.protect("sensitive:biometric");
+        prot.protect("sensitive:pii");
+        if let Err(e) = system.storage.put_protected_set(&prot.protected) {
+            log::warn!("Failed to persist protective seal: {:?}", e);
+        } else {
+            println!("Protective seal set persisted ({} items)", prot.protected.len());
+        }
+    }
+
+    // Generate synthetic dataset
+    let dim = config.fragment_dimensions;
+    let base_count = 500usize;
+    let variants_per_base = 3usize;
+    println!(
+        "Generating synthetic dataset ({} bases x {} variants = {} memories)...",
+        base_count,
+        variants_per_base,
+        base_count * variants_per_base
+    );
+    let mut rng = thread_rng();
+    let mut memories: Vec<Vec<DreamFragment>> = Vec::with_capacity(base_count);
+    for i in 0..base_count {
+        let base_vec: Vec<f64> = (0..dim).map(|_| rng.gen::<f64>()).collect();
+        let variants = spawn_illusions(&base_vec, &mut rng);
+        let mut mems = Vec::with_capacity(variants_per_base);
+        for (j, v) in variants.into_iter().enumerate() {
+            let id = Uuid::new_v4();
+            let mem = DreamFragment {
+                id,
+                embedding: v.1,
+                feature_channels: HashMap::new(),
+                modality: PerceptionLayer::Sight,
+                context: AmbientCanvas::default(),
+                confidence: 0.9,
+                origin_timestamp: SystemTime::now(),
+                last_accessed: SystemTime::now(),
+                access_count: 0,
+                decay_factor: 0.999,
+                source_agent_id: Uuid::new_v4(),
+                semantic_tags: vec![format!("base{}", i)],
+                dimensionality: dim,
+            };
+            system
+                .atelier_keeper
+                .index_and_archive(&mem)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            if j < variants_per_base {
+                mems.push(mem);
+            }
+        }
+        memories.push(mems);
+    }
+    println!(
+        "Generated {} base objects with {} variants each ({} total)",
+        base_count,
+        variants_per_base,
+        base_count * variants_per_base
+    );
+
+    // Build illusion pair list for depth trial
+    let mut pairs: Vec<(DreamFragment, DreamFragment, bool)> = Vec::new();
+    for mems in &memories {
+        for a in 0..mems.len() {
+            for b in (a + 1)..mems.len() {
+                pairs.push((mems[a].clone(), mems[b].clone(), true));
+            }
+        }
+    }
+    let shatter_attempts = base_count * 4;
+    for _ in 0..shatter_attempts {
+        let i = rng.gen_range(0..memories.len());
+        let j = rng.gen_range(0..memories.len());
+        if i == j {
+            continue;
+        }
+        let a_idx = rng.gen_range(0..memories[i].len());
+        let b_idx = rng.gen_range(0..memories[j].len());
+        pairs.push((memories[i][a_idx].clone(), memories[j][b_idx].clone(), false));
+    }
+    pairs.shuffle(&mut rng);
+
+    // Run depth trial
+    println!("Running offline benchmark on {} pairs...", pairs.len());
+    let mut illusion_pairs: Vec<(Vec<f64>, Vec<f64>, bool)> = Vec::new();
+    for (a, b, same) in &pairs {
+        illusion_pairs.push((a.embedding.clone(), b.embedding.clone(), *same));
+    }
+    let threshold_seq: Vec<f64> = (0..=20).map(|i| 0.5 + i as f64 * 0.025).collect();
+    let harmonic_arbiter_bench = HarmonicCritic::new(0.75);
+    match depth_benchmark(&illusion_pairs, metric.as_ref(), &harmonic_arbiter_bench, &threshold_seq) {
+        Ok(result) => {
+            println!("--- Benchmark Results ---");
+            println!("AUC: {:.4}", result.auc);
+            println!("Best threshold: {:.3}", result.best_threshold);
+            println!("Best F1: {:.4}", result.best_f1);
+            println!("Avg same-class score: {:.4}", result.avg_score_same);
+            println!("Avg diff-class score: {:.4}", result.avg_score_diff);
+        }
+        Err(e) => {
+            log::warn!("Depth trial error: {:?}", e);
+        }
+    }
+
+    // Export K8s manifests
+    export_k8s_manifests("k8s_manifests.yaml")?;
+
+    // Flush storage
+    system.storage.flush().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    println!("============================================================");
+    println!("  梦与非梦皆尽碎系统 初始化完成 碎尽而新梦生");
+    println!("============================================================");
+    println!("Prometheus metrics: http://{}/metrics", config.metrics_addr);
+    println!("Health endpoint:    http://{}/health", config.metrics_addr);
+    println!("API server:         http://{}", config.gateway_addr);
+    println!("DreamArchive path:       {}", config.archive_path);
+    println!("轻触 Ctrl+C 直面碎裂...");
+
+    // Spawn redraw threads
+    let system_clone = Arc::clone(&system);
+    let background_handle = tokio::spawn(async move {
+        #[cfg(unix)]
+        let mut shutdown_signal = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ).ok();
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                    if system_clone.is_stopped() {
+                        break;
+                    }
+                    system_clone.atelier_keeper.dissipate_overdue_chambers();
+                    while let Some(result) = system_clone.process_next_ready() {
+                        match result {
+                            Ok(sub) => log::info!("transcendence achieved: id={} quality={:.4}", sub.id, sub.redraw_quality),
+                            Err(e) => log::warn!("transcendence failed: {:?}", e),
+                        }
+                    }
+                }
+                _ = async {
+                    #[cfg(unix)]
+                    {
+                        if let Some(ref mut sig) = shutdown_signal {
+                            sig.recv().await;
+                        } else {
+                            tokio::signal::ctrl_c().await.ok();
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        tokio::signal::ctrl_c().await.ok();
+                    }
+                } => {
+                    log::info!("dissolution signal received, halting the drawing");
+                    system_clone.shutdown();
+                    break;
+                }
+            }
+        }
+    });
+
+    // Start API server
+    let gateway_addr: SocketAddr = config.gateway_addr.parse()?;
+    let api_handle = tokio::spawn(start_gateway_server(system.clone(), gateway_addr));
+
+    // Await redraw threads
+    let _ = background_handle.await;
+    let _ = api_handle.await;
+
+    // Final flush
+    system.shutdown();
+    log::info!("Somniacta System shattered into new dreams...");
+    Ok(())
+}
